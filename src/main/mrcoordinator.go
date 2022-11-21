@@ -21,8 +21,14 @@ func main() {
 	}
 
 	m := mr.MakeCoordinator(os.Args[1:], 10)
-	for m.Done() == false {
+	for !m.Done() {
 		time.Sleep(time.Second)
+		m.Locker.Lock()
+		if m.Called {
+			fmt.Printf("called. nreduce = %d.\n", m.NReduce)
+			m.Called = false
+		}
+		m.Locker.Unlock()
 	}
 
 	time.Sleep(time.Second)
