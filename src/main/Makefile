@@ -1,4 +1,4 @@
-FILE ?= no_file
+FILE ?= pg-metamorphosis.txt
 
 PHONY: build co worker
 
