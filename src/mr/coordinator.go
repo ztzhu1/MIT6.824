@@ -1,22 +1,58 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "sync"
-import "net/rpc"
-import "net/http"
+import (
+	// "fmt"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+
+	"6.824/assert"
+)
+
+// import "sync"
 
 
 type Coordinator struct {
 	// Your definitions here.
-	NReduce int
-	Called bool
-	Locker sync.Mutex
+	nReduce          int
+	files            []string
+	tasks_unassigned chan *Task
+	tasks_assigned   chan *Task
 }
 
 // Your code here -- RPC handlers for the worker to call.
+func (c *Coordinator) generateMapTasks() {
+	for i, file := range c.files {
+		task := new(Task)
+		task.Type = MAP
+		task.Id = c.getTaskId(file)
 
+		task.InputName = file
+		task.OutputName = "mr-%v-%v"
+		task.OutputName = fmt.Sprintf(task.OutputName, task.Id, i)
+
+		c.tasks_unassigned <- task
+	}
+}
+
+func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
+	var ok bool
+	reply.Task_, ok = <- c.tasks_unassigned
+	c.tasks_assigned <- reply.Task_
+	assert.Assert(ok)
+	return nil
+}
+
+func (c *Coordinator) getTaskId(key string) int {
+	return ihash(key) % c.nReduce
+}
+
+func (c *Coordinator) getTaskNum() int {
+	return len(c.files)
+}
 //
 // an example RPC handler.
 //
@@ -24,9 +60,6 @@ type Coordinator struct {
 //
 func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	reply.Y = args.X + 1
-	c.Locker.Lock()
-	c.Called = true
-	c.Locker.Unlock()
 	return nil
 }
 
@@ -69,10 +102,24 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
-	c.NReduce = nReduce
-	c.Called = false
 
+	/**
+	 * Pass parameters
+	 */
+	c.nReduce = nReduce
 
+	fileNum := len(files)
+	c.files = make([]string, fileNum)
+	assert.Assert(copy(c.files, files) == fileNum)
+
+	c.tasks_unassigned = make(chan *Task, c.getTaskNum())
+	c.tasks_assigned   = make(chan *Task, c.getTaskNum())
+
+	c.generateMapTasks()
+	/**
+	 * Start listening
+	 */
 	c.server()
+
 	return &c
 }

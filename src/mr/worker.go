@@ -1,10 +1,13 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
 
+	"6.824/assert"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -32,10 +35,24 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	args := TaskArgs{}
+	reply := TaskReply{}
 
-	// uncomment to send the Example RPC to the coordinator.
-	CallExample()
+	ok := call("Coordinator.AssignTask", &args, &reply)
+	assert.Assert(ok)
 
+	task := reply.Task_
+
+	if task.Type == FAKE {
+		fmt.Printf("\033[1;34m")
+		fmt.Printf("Received fake task. Quit worker.\n")
+		fmt.Printf("\033[0m")
+		return
+	} else {
+		fmt.Printf("\033[1;32m")
+		fmt.Printf("id: %v, in: %v, out: %v\n", task.Id, task.InputName, task.OutputName)
+		fmt.Printf("\033[0m")
+	}
 }
 
 //
@@ -86,6 +103,8 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
+	fmt.Printf("\033[1;31m")
 	fmt.Println(err)
+	fmt.Printf("\033[0m")
 	return false
 }
