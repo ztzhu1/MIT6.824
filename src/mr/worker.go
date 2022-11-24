@@ -1,14 +1,16 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
-	"io/ioutil"
+	"path/filepath"
 	"sort"
-	"errors"
+	"strconv"
 	"6.824/assert"
 )
 
@@ -49,55 +51,36 @@ func Worker(mapf func(string, string) []KeyValue,
 	args := TaskArgs{}
 	reply := TaskReply{}
 
-	ok := call("Coordinator.AssignTask", &args, &reply)
-	assert.Assert(ok)
+	for cond := true; cond; {
+		ok := call("Coordinator.AssignTask", &args, &reply)
+		assert.Assert(ok)
 
-	task := reply.Task_
+		task := reply.Task_
 
-	if task.Type == FAKE {
-		fmt.Printf("\033[1;34m")
-		fmt.Printf("Received fake task. Worker quited.\n")
-		fmt.Printf("\033[0m")
-	} else {
-		fmt.Printf("\033[1;32m")
-		fmt.Printf("id: %v, in: %v, out: %v\n", task.Id, task.InputName, task.OutputName)
-		fmt.Printf("\033[0m")
+		fmt.Println(task.Type, task.ID, task.InputName, task.OutputName)
+		if task.Type == MAP {
+			contentPtr := read(task.InputName)
+			ofileTempName := mapHelper(task.InputName,
+									   task.OutputName,
+									   contentPtr,
+									   mapf)
+			// notify the coordinator this worker has
+			// completed its task
+			notify(task, &ofileTempName, &args, &reply)
+		} else if task.Type == REDUCE {
+			ofileTempName := reduceHelper(task.InputName,
+										  task.OutputName,	
+										  reducef)
+			// notify the coordinator this worker has
+			// completed its task
+			notify(task, &ofileTempName, &args, &reply)
+		} else {
+			fmt.Printf("\033[1;32m")
+			fmt.Printf("QUIT")
+			fmt.Printf("\033[0m")
 
-		contentPtr := read(task.InputName)
-		mapHelper(task.InputName,
-				  task.OutputName + "-",
-				  contentPtr,
-				  mapf)
-		// result := reduceHelper(kva, reducef)
-	}
-}
-
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+			cond = false
+		}
 	}
 }
 
@@ -126,6 +109,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	return false
 }
 
+// private methods
 func read(filename string) *string {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -144,55 +128,105 @@ func read(filename string) *string {
 func mapHelper(inputName  string,
 			   outputName string,
 			   contentPtr *string,
-			   mapf func(string, string) []KeyValue) {
+			   mapf func(string, string) []KeyValue) string {
 	kva := mapf(inputName, *contentPtr)
 	sort.Sort(ByKey(kva))
 
-	ofile, _ := os.CreateTemp("./", outputName)
+	ofile, _ := os.CreateTemp("./", outputName + "-")
+	enc := json.NewEncoder(ofile)
+
 	for _, kv := range kva {
-		fmt.Fprintf(ofile, "%v %v\n", kv.Key, kv.Value)
+		enc.Encode(&kv)
 	}
 	ofile.Close()
-	renameOrDrop(ofile.Name())
+
+	return ofile.Name()
 }
 
-func reduceHelper(mapFile string, reducef func(string, []string) string) {
-	intermediate := []KeyValue{}
-	intermediate = append(intermediate, kva...)
-	sort.Sort(ByKey(intermediate))
+func reduceHelper(inputPattern string,
+				  outputName string,
+				  reducef func(string, []string) string) string {
+	mapFiles, _ := filepath.Glob(inputPattern)
+	if mapFiles == nil {
+		return ""
+	}
 
-	result := []KeyValue{}
+	kva := []KeyValue{}
+	for _, mapFile := range mapFiles {
+		kva = append(kva, reduceOne(mapFile, reducef)...)
+	}
+	sort.Sort(ByKey(kva))
+
+	ofile, _ := os.CreateTemp("./", outputName + "-")
 
 	i := 0
-	for i < len(intermediate) {
+	for i < len(kva) {
 		j := i + 1
-		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		sum := 0
+		for k := i; k < j; k++ {
+			v, err := strconv.Atoi(kva[k].Value)
+			assert.Assert(err == nil)
+			sum += v
+		}
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, sum)
+
+		i = j
+	}
+
+	ofile.Close()
+
+	return ofile.Name()
+}
+
+func reduceOne(mapFile string, reducef func(string, []string) string) []KeyValue {
+	ifile, err := os.Open(mapFile)
+
+	assert.Assert(err == nil)
+
+	kva := []KeyValue{}
+	dec := json.NewDecoder(ifile)
+	for {
+		var kv KeyValue
+		if err = dec.Decode(&kv); err != nil {
+			break
+		}
+		kva = append(kva, kv)
+	}
+
+	ifile.Close()
+
+	result := []KeyValue{}
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
 			j++
 		}
 		values := []string{}
 		for k := i; k < j; k++ {
-			values = append(values, intermediate[k].Value)
+			values = append(values, kva[k].Value)
 		}
-		output := reducef(intermediate[i].Key, values)
+		output := reducef(kva[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
 		// fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
-		result = append(result, KeyValue{intermediate[i].Key, output})
+		result = append(result, KeyValue{kva[i].Key, output})
 
 		i = j
 	}
+	return result
 }
 
-func renameOrDrop(filename string) bool {
-	var renamed bool
-	file := lockfile.Lockfile(filename)
-	err := file.TryLock()
-	if err == nil {
-		exist = true
-	} else if errors.Is(err, os.ErrNotExist) {
-		exist = false
-	} else {
-		assert.Assert(false)
-	}
-	return renamed
+func notify(task *Task,
+			ofileTempName *string,
+			args *TaskArgs,
+			reply *TaskReply) {
+	args.TaskID = task.ID
+	args.TempName = *ofileTempName
+	args.Name = task.OutputName
+	ok := call("Coordinator.CompleteTask", args, reply)
+	assert.Assert(ok)
 }

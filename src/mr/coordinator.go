@@ -1,66 +1,146 @@
 package mr
 
 import (
-	// "fmt"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 
 	"6.824/assert"
 )
 
-// import "sync"
-
+const taskTimeOut = 10
 
 type Coordinator struct {
 	// Your definitions here.
 	nReduce          int
-	files            []string
 	tasks_unassigned chan *Task
-	tasks_assigned   chan *Task
+	map_tasks        [] *Task
+	reduce_tasks     [] *Task
+	mu               sync.Mutex
+	mapDone          bool
 }
 
 // Your code here -- RPC handlers for the worker to call.
-func (c *Coordinator) generateMapTasks() {
-	for i, file := range c.files {
+func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
+	if !c.Done() {
+		var ok bool
+		reply.Task_, ok = <- c.tasks_unassigned
+		reply.Task_.Processing = true
+		assert.Assert(ok)
+	} else {
+		task := new(Task)
+		task.Type = FAKE
+		reply.Task_ = task
+	}
+	return nil
+}
+
+func (c *Coordinator) CompleteTask(args *TaskArgs, reply *TaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.mapDone {
+	// check map task
+		for i := 0; i < len(c.map_tasks); i++ {
+			if c.map_tasks[i].ID == args.TaskID {
+				// rename temp file
+				err := os.Rename(args.TempName, args.Name)
+				assert.Assert(err == nil)
+				// pop the task which was just completed
+				c.map_tasks = append(c.map_tasks[:i], c.map_tasks[i+1:]...)
+				break
+			}
+		}
+
+		if len(c.map_tasks) == 0 {
+		// all map tasks are done
+			c.mapDone = true
+			c.pushTask(c.reduce_tasks)
+		}
+
+		// remove temp file anyway
+		os.Remove(args.TempName)
+	} else {
+	// check reduce task
+		for i := 0; i < len(c.reduce_tasks); i++ {
+			if c.reduce_tasks[i].ID == args.TaskID {
+				// rename temp file
+				if args.TempName != "" {
+					err := os.Rename(args.TempName, args.Name)
+					assert.Assert(err == nil)
+				}
+				// pop the task which was just completed
+				c.reduce_tasks = append(c.reduce_tasks[:i], c.reduce_tasks[i+1:]...)
+				break
+			}
+		}
+
+		// remove temp files anyway
+		fileNameSlice := strings.Split(args.Name, "-")
+		pattern := "mr-*-" + fileNameSlice[len(fileNameSlice) - 1]
+		tempFiles, _ := filepath.Glob(pattern)
+		for _, tempFile := range tempFiles {
+			if strings.Split(tempFile, "-")[1] != "out" {
+				os.Remove(tempFile)
+			}
+		}
+	}
+	return nil
+}
+
+// private method
+func (c *Coordinator) generateMapTasks(files []string) {
+	for _, file := range files {
 		task := new(Task)
 		task.Type = MAP
-		task.Id = c.getTaskId(file)
+		task.ID = ihash(file)
+		task.Processing = false
+		task.ProcTime = 0
 
-		task.InputName = file
+		task.InputName  = file
 		task.OutputName = "mr-%v-%v"
-		task.OutputName = fmt.Sprintf(task.OutputName, task.Id, i)
+		task.OutputName = fmt.Sprintf(task.OutputName, 0, task.ID % c.nReduce)
 
+		c.map_tasks = append(c.map_tasks, task)
+	}
+}
+
+func (c *Coordinator) generateReduceTasks() {
+	for i := 0; i < c.nReduce; i++ {
+		task := new(Task)
+		task.Type = REDUCE
+		// Rpc passes wrong value when i == 0.
+		// I have no idea about the reason now. 
+		task.ID = i + 1 
+		task.Processing = false
+		task.ProcTime = 0
+
+		task.InputName  = "mr-*-" + strconv.Itoa(i)
+		task.OutputName = "mr-out-%v"
+		task.OutputName = fmt.Sprintf(task.OutputName, i)
+
+		c.reduce_tasks = append(c.reduce_tasks, task)
+	}
+}
+
+func (c *Coordinator) pushTask(tasks [] *Task) {
+	for _, task := range tasks {
 		c.tasks_unassigned <- task
 	}
 }
 
-func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
-	var ok bool
-	reply.Task_, ok = <- c.tasks_unassigned
-	c.tasks_assigned <- reply.Task_
-	assert.Assert(ok)
-	return nil
-}
-
-func (c *Coordinator) getTaskId(key string) int {
-	return ihash(key) % c.nReduce
-}
-
-func (c *Coordinator) getTaskNum() int {
-	return len(c.files)
-}
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
+func max(a, b int) int {
+	if (a > b) {
+		return a
+	}
+	return b
 }
 
 
@@ -85,12 +165,12 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	ret := false
-
 	// Your code here.
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-
-	return ret
+	done := len(c.reduce_tasks) == 0
+	return done
 }
 
 //
@@ -98,7 +178,7 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 //
-func MakeCoordinator(files []string, nReduce int) *Coordinator {
+func MakeCoordinator(patterns []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
@@ -107,19 +187,61 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	 * Pass parameters
 	 */
 	c.nReduce = nReduce
+	c.mapDone = false
 
-	fileNum := len(files)
-	c.files = make([]string, fileNum)
-	assert.Assert(copy(c.files, files) == fileNum)
+	/**
+	 * Generate tasks
+	 */
+	var files []string
+	for _, pattern := range patterns {
+		matches, _ := filepath.Glob(pattern)
+		files = append(files, matches...)
+	}
+	c.generateMapTasks(files)
+	c.generateReduceTasks()
 
-	c.tasks_unassigned = make(chan *Task, c.getTaskNum())
-	c.tasks_assigned   = make(chan *Task, c.getTaskNum())
+	/**
+	 * Make channel
+	 */
+	c.tasks_unassigned = make(
+		chan *Task,
+		max(len(c.map_tasks), len(c.reduce_tasks)))
+	/**
+	 * Push map tasks into channel.
+	 * Reduce tasks will be pushed after map tasks are done
+	 */
+	c.pushTask(c.map_tasks)
 
-	c.generateMapTasks()
 	/**
 	 * Start listening
 	 */
 	c.server()
 
 	return &c
+}
+
+func (c *Coordinator) Tick() {
+	var tasks [] *Task
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.mapDone {
+		tasks = c.map_tasks
+	} else {
+		tasks = c.reduce_tasks
+	}
+
+	for _, task := range tasks {
+		if (task.Processing) {
+			task.ProcTime++
+		}
+		// if timeout, re-assign the task
+		if task.ProcTime > taskTimeOut {
+			task.ProcTime = 0
+			task.Processing = false
+			c.tasks_unassigned <- task
+		}
+	}
+	
 }
