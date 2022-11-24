@@ -24,7 +24,9 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 type TaskArgs struct {
-	Y int
+	TaskID   int
+	TempName string
+	Name     string
 }
 
 type TaskReply struct {
