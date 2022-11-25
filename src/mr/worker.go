@@ -75,10 +75,6 @@ func Worker(mapf func(string, string) []KeyValue,
 			// completed its task
 			notify(task, &ofileTempName, &args, &reply)
 		} else {
-			fmt.Printf("\033[1;32m")
-			fmt.Printf("QUIT")
-			fmt.Printf("\033[0m")
-
 			cond = false
 		}
 	}
