@@ -11,8 +11,8 @@ const (
 type Task struct {
 	Type       TaskType
 	ID         int
-	Processing bool
-	ProcTime   uint32 // processing time
 	InputName  string
 	OutputName string
+	processing bool
+	procTime   int64 // processing time
 }
