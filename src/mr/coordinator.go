@@ -15,7 +15,7 @@ import (
 	"6.824/assert"
 )
 
-const taskTimeOut = 10
+const taskTimeOut = 10 * 1000 // 10s
 
 type Coordinator struct {
 	// Your definitions here.
@@ -29,10 +29,14 @@ type Coordinator struct {
 
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
-	if !c.Done() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Can't use c.Done(), or dead lock occurs.
+	done := len(c.reduce_tasks) == 0
+	if !done {
 		var ok bool
 		reply.Task_, ok = <- c.tasks_unassigned
-		reply.Task_.Processing = true
+		reply.Task_.processing = true
 		assert.Assert(ok)
 	} else {
 		task := new(Task)
@@ -101,8 +105,8 @@ func (c *Coordinator) generateMapTasks(files []string) {
 		task := new(Task)
 		task.Type = MAP
 		task.ID = ihash(file)
-		task.Processing = false
-		task.ProcTime = 0
+		task.processing = false
+		task.procTime = 0
 
 		task.InputName  = file
 		task.OutputName = "mr-%v-%v"
@@ -119,8 +123,8 @@ func (c *Coordinator) generateReduceTasks() {
 		// Rpc passes wrong value when i == 0.
 		// I have no idea about the reason now. 
 		task.ID = i + 1 
-		task.Processing = false
-		task.ProcTime = 0
+		task.processing = false
+		task.procTime = 0
 
 		task.InputName  = "mr-*-" + strconv.Itoa(i)
 		task.OutputName = "mr-out-%v"
@@ -220,7 +224,7 @@ func MakeCoordinator(patterns []string, nReduce int) *Coordinator {
 	return &c
 }
 
-func (c *Coordinator) Tick() {
+func (c *Coordinator) Tick(elapsed_ms int64) {
 	var tasks [] *Task
 
 	c.mu.Lock()
@@ -233,14 +237,14 @@ func (c *Coordinator) Tick() {
 	}
 
 	for _, task := range tasks {
-		if (task.Processing) {
-			task.ProcTime++
-		}
-		// if timeout, re-assign the task
-		if task.ProcTime > taskTimeOut {
-			task.ProcTime = 0
-			task.Processing = false
-			c.tasks_unassigned <- task
+		if (task.processing) {
+			task.procTime += elapsed_ms
+			// if timeout, re-assign the task
+			if task.procTime > taskTimeOut {
+				task.procTime = 0
+				task.processing = false
+				c.tasks_unassigned <- task
+			}
 		}
 	}
 	
