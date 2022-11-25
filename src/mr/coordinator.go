@@ -110,7 +110,7 @@ func (c *Coordinator) generateMapTasks(files []string) {
 
 		task.InputName  = file
 		task.OutputName = "mr-%v-%v"
-		task.OutputName = fmt.Sprintf(task.OutputName, 0, task.ID % c.nReduce)
+		task.OutputName = fmt.Sprintf(task.OutputName, task.ID, task.ID % c.nReduce)
 
 		c.map_tasks = append(c.map_tasks, task)
 	}
@@ -120,9 +120,7 @@ func (c *Coordinator) generateReduceTasks() {
 	for i := 0; i < c.nReduce; i++ {
 		task := new(Task)
 		task.Type = REDUCE
-		// Rpc passes wrong value when i == 0.
-		// I have no idea about the reason now. 
-		task.ID = i + 1 
+		task.ID = i 
 		task.processing = false
 		task.procTime = 0
 

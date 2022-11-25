@@ -48,10 +48,10 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-	args := TaskArgs{}
-	reply := TaskReply{}
 
 	for cond := true; cond; {
+		args := TaskArgs{}
+		reply := TaskReply{}
 		ok := call("Coordinator.AssignTask", &args, &reply)
 		assert.Assert(ok)
 
