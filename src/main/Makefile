@@ -1,6 +1,6 @@
 FILE ?= pg-metamorphosis.txt
 
-PHONY: build co worker
+PHONY: build co worker clean
 
 build:
 	go build -race -buildmode=plugin ../mrapps/wc.go
@@ -10,3 +10,6 @@ co:
 
 worker: build
 	go run -race mrworker.go wc.so
+
+clean:
+	rm mr-out*
