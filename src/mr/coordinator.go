@@ -11,11 +11,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"6.824/assert"
 )
 
-const taskTimeOut = 10 * 1000 // 10s
+const taskTimeOut    = 10 * 1000 // 10s
+const channelTimeOut =  5 * 1000 //  5s
 
 type Coordinator struct {
 	// Your definitions here.
@@ -35,8 +37,15 @@ func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 	done := len(c.reduce_tasks) == 0
 	if !done {
 		var ok bool
-		reply.Task_, ok = <- c.tasks_unassigned
-		reply.Task_.processing = true
+		select {
+		case reply.Task_, ok = <- c.tasks_unassigned:
+			reply.Task_.processing = true
+		case <-time.After(channelTimeOut * time.Millisecond):
+			task := new(Task)
+			task.Type = FAKE
+			reply.Task_ = task
+			return nil
+		}
 		assert.Assert(ok)
 	} else {
 		task := new(Task)
