@@ -8,10 +8,11 @@ import (
 	"net/rpc"
 	"os"
 	"path/filepath"
+	"io/ioutil"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
+	"regexp"
 
 	"6.824/assert"
 )
@@ -27,6 +28,7 @@ type Coordinator struct {
 	reduce_tasks     [] *Task
 	mu               sync.Mutex
 	mapDone          bool
+	cleanDone        bool
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -77,9 +79,6 @@ func (c *Coordinator) CompleteTask(args *TaskArgs, reply *TaskReply) error {
 			c.mapDone = true
 			c.pushTask(c.reduce_tasks)
 		}
-
-		// remove temp file anyway
-		os.Remove(args.TempName)
 	} else {
 	// check reduce task
 		for i := 0; i < len(c.reduce_tasks); i++ {
@@ -94,16 +93,12 @@ func (c *Coordinator) CompleteTask(args *TaskArgs, reply *TaskReply) error {
 				break
 			}
 		}
-
-		// remove temp files anyway
-		fileNameSlice := strings.Split(args.Name, "-")
-		pattern := "mr-*-" + fileNameSlice[len(fileNameSlice) - 1]
-		tempFiles, _ := filepath.Glob(pattern)
-		for _, tempFile := range tempFiles {
-			if strings.Split(tempFile, "-")[1] != "out" {
-				os.Remove(tempFile)
-			}
-		}
+	}
+	// clean temp files after all tasks are done
+	done := len(c.reduce_tasks) == 0
+	if done && !c.cleanDone {
+		c.removeAllTempFiles()
+		c.cleanDone = true
 	}
 	return nil
 }
@@ -144,6 +139,18 @@ func (c *Coordinator) generateReduceTasks() {
 func (c *Coordinator) pushTask(tasks [] *Task) {
 	for _, task := range tasks {
 		c.tasks_unassigned <- task
+	}
+}
+
+func (c *Coordinator) removeAllTempFiles() {
+	mapPattern, _    := regexp.Compile("mr-\\d+-\\d+")
+	reducePattern, _ := regexp.Compile("mr-out-\\d+-\\d+")
+	files, _ := ioutil.ReadDir("./")
+	for _, tempFile := range files {
+		if mapPattern.MatchString(tempFile.Name()) ||
+           reducePattern.MatchString(tempFile.Name()) {
+			os.Remove(tempFile.Name())
+		}
 	}
 }
 
@@ -197,8 +204,9 @@ func MakeCoordinator(patterns []string, nReduce int) *Coordinator {
 	/**
 	 * Pass parameters
 	 */
-	c.nReduce = nReduce
-	c.mapDone = false
+	c.nReduce   = nReduce
+	c.mapDone   = false
+	c.cleanDone = false
 
 	/**
 	 * Generate tasks
@@ -251,6 +259,7 @@ func (c *Coordinator) Tick(elapsed_ms int64) {
 				task.procTime = 0
 				task.processing = false
 				c.tasks_unassigned <- task
+				fmt.Println("reassign:", task.Type, task.ID, task.InputName, task.OutputName)
 			}
 		}
 	}
