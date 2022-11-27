@@ -168,7 +168,7 @@ func reduceHelper(inputPattern string,
 
 	kva := []KeyValue{}
 	for _, mapFile := range mapFiles {
-		kva = append(kva, reduceOne(mapFile, reducef)...)
+		kva = append(kva, loadOne(mapFile)...)
 	}
 	sort.Sort(ByKey(kva))
 
@@ -180,13 +180,13 @@ func reduceHelper(inputPattern string,
 		for j < len(kva) && kva[j].Key == kva[i].Key {
 			j++
 		}
-		sum := 0
+		values := []string{}
 		for k := i; k < j; k++ {
-			v, err := strconv.Atoi(kva[k].Value)
-			assert.Assert(err == nil)
-			sum += v
+			values = append(values, kva[k].Value)
 		}
-		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, sum)
+		output := reducef(kva[i].Key, values)
+
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
 
 		i = j
 	}
@@ -197,7 +197,7 @@ func reduceHelper(inputPattern string,
 	return &tempNames
 }
 
-func reduceOne(mapFile string, reducef func(string, []string) string) []KeyValue {
+func loadOne(mapFile string) []KeyValue {
 	ifile, err := os.Open(mapFile)
 
 	assert.Assert(err == nil)
@@ -214,26 +214,7 @@ func reduceOne(mapFile string, reducef func(string, []string) string) []KeyValue
 
 	ifile.Close()
 
-	result := []KeyValue{}
-	i := 0
-	for i < len(kva) {
-		j := i + 1
-		for j < len(kva) && kva[j].Key == kva[i].Key {
-			j++
-		}
-		values := []string{}
-		for k := i; k < j; k++ {
-			values = append(values, kva[k].Value)
-		}
-		output := reducef(kva[i].Key, values)
-
-		// this is the correct format for each line of Reduce output.
-		// fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
-		result = append(result, KeyValue{kva[i].Key, output})
-
-		i = j
-	}
-	return result
+	return kva
 }
 
 func reduceIdx(key string, nReduce int) int {
