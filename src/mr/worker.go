@@ -32,10 +32,7 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-// after maxRequestTime * waitTime ms
-// the work will be forced to quit
 const waitTime       =  600 // 600 ms
-const maxRequestTime =   10
 
 
 //
@@ -57,11 +54,10 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 
-	for i := 0; i < maxRequestTime; {
+	for {
 		args := TaskArgs{}
 		reply := TaskReply{}
 		ok := call("Coordinator.AssignTask", &args, &reply)
-		i++
 		if !ok {
 			return
 		}
@@ -69,7 +65,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		task := reply.Task_
 
-		fmt.Println(task.Type, task.ID, task.InputName, task.OutputName)
+		// fmt.Println(task.Type, task.ID, task.InputName, task.OutputName)
 		if task.Type == MAP {
 			contentPtr := read(task.InputName)
 			ofileTempNames := mapHelper(task.InputName,
@@ -87,9 +83,12 @@ func Worker(mapf func(string, string) []KeyValue,
 			// notify the coordinator this worker has
 			// completed its task
 			notify(task, ofileTempNames, &args, &reply)
-		} else {
-			// Fake task
+		} else if task.Type == REREQ {
 			time.Sleep(waitTime * time.Millisecond)
+		} else if task.Type == QUIT {
+			return
+		} else {
+			assert.Assert(false)
 		}
 	}
 }
@@ -249,6 +248,5 @@ func notify(task *Task,
 	args.TaskID = task.ID
 	args.TempNames = *ofileTempNames
 	args.Name = task.OutputName
-	ok := call("Coordinator.CompleteTask", args, reply)
-	assert.Assert(ok)
+	call("Coordinator.CompleteTask", args, reply)
 }

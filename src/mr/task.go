@@ -1,11 +1,14 @@
 package mr
 
+import "time"
+
 type TaskType uint8
 
 const (
 	MAP    TaskType = 0
 	REDUCE TaskType = 1
-	FAKE   TaskType = 2
+	REREQ  TaskType = 2 // re-request
+	QUIT   TaskType = 3
 )
 
 type Task struct {
@@ -14,5 +17,5 @@ type Task struct {
 	InputName  string
 	OutputName string
 	processing bool
-	procTime   int64 // processing time
+	procStart  time.Time
 }

@@ -17,8 +17,8 @@ import (
 	"6.824/assert"
 )
 
-const taskTimeOut    = 10 * 1000 // 10s
-const assignTimeOut  =  2 * 1000 //  2s
+const taskTimeOut    =  4 * time.Second
+const assignTimeOut  =  2 * time.Second
 
 type Coordinator struct {
 	// Your definitions here.
@@ -44,19 +44,20 @@ func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 		select {
 		case reply.Task_, ok = <- c.tasks_unassigned:
 			reply.Task_.processing = true
-		case <-time.After(assignTimeOut * time.Millisecond):
-			AssignFakeTask(reply)
+			reply.Task_.procStart = time.Now()
+		case <-time.After(assignTimeOut):
+			AssignTaskType(reply, REREQ)
 		}
 		assert.Assert(ok)
 	} else {
-		AssignFakeTask(reply)
+		AssignTaskType(reply, QUIT)
 	}
 	return nil
 }
 
-func AssignFakeTask(reply *TaskReply) {
+func AssignTaskType(reply *TaskReply, T TaskType) {
 	task := new(Task)
-	task.Type = FAKE
+	task.Type = T
 	reply.Task_ = task
 }
 
@@ -115,7 +116,6 @@ func (c *Coordinator) generateMapTasks(files []string) {
 		task.Type = MAP
 		task.ID = i
 		task.processing = false
-		task.procTime = 0
 
 		task.InputName  = file
 		task.OutputName = "mr-%v-"
@@ -131,7 +131,6 @@ func (c *Coordinator) generateReduceTasks() {
 		task.Type = REDUCE
 		task.ID = i 
 		task.processing = false
-		task.procTime = 0
 
 		task.InputName  = "mr-*-%v"
 		task.InputName  = fmt.Sprintf(task.InputName, i)
@@ -238,7 +237,7 @@ func MakeCoordinator(patterns []string, nReduce int) *Coordinator {
 	return &c
 }
 
-func (c *Coordinator) Tick(elapsed_ms int64) {
+func (c *Coordinator) Tick() {
 	var tasks [] *Task
 
 	c.mu.Lock()
@@ -252,15 +251,12 @@ func (c *Coordinator) Tick(elapsed_ms int64) {
 
 	for _, task := range tasks {
 		if (task.processing) {
-			task.procTime += elapsed_ms
+			elapsed_ns := time.Since(task.procStart)
 			// if timeout, re-assign the task
-			if task.procTime > taskTimeOut {
-				task.procTime = 0
+			if elapsed_ns > taskTimeOut {
 				task.processing = false
 				c.tasks_unassigned <- task
-				fmt.Printf("\033[1;33m")
-				fmt.Println("reassign:", task.Type, task.ID, task.InputName, task.OutputName)
-				fmt.Printf("\033[0m")
+				fmt.Printf("\033[1;33mreassigned task: %v %v %v %v\033[0m\n", task.Type, task.ID, task.InputName, task.OutputName)
 			}
 		}
 	}
