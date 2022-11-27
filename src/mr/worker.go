@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 	"6.824/assert"
 )
 
@@ -29,6 +31,12 @@ type ByKey []KeyValue
 func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+// after maxRequestTime * waitTime ms
+// the work will be forced to quit
+const waitTime       =  600 // 600 ms
+const maxRequestTime =   10
+
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -49,11 +57,15 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 
-	for cond := true; cond; {
+	for i := 0; i < maxRequestTime; {
 		args := TaskArgs{}
 		reply := TaskReply{}
 		ok := call("Coordinator.AssignTask", &args, &reply)
-		assert.Assert(ok)
+		i++
+		if !ok {
+			return
+		}
+		// assert.Assert(ok)
 
 		task := reply.Task_
 
@@ -76,7 +88,8 @@ func Worker(mapf func(string, string) []KeyValue,
 			// completed its task
 			notify(task, ofileTempNames, &args, &reply)
 		} else {
-			cond = false
+			// Fake task
+			time.Sleep(waitTime * time.Millisecond)
 		}
 	}
 }
@@ -91,7 +104,8 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		// log.Fatal("dialing:", err)
+		return false
 	}
 	defer c.Close()
 
@@ -162,12 +176,19 @@ func reduceHelper(inputPattern string,
 	var tempNames []string
 
 	mapFiles, _ := filepath.Glob(inputPattern)
-	if mapFiles == nil {
+	// filtering unwanted temp files
+	mapFilesFiltered := []string{}
+	for _, file := range mapFiles {
+		if strings.Count(file, "-") == 2 {
+			mapFilesFiltered = append(mapFilesFiltered, file)
+		}
+	}
+	if mapFilesFiltered == nil {
 		return &tempNames
 	}
 
 	kva := []KeyValue{}
-	for _, mapFile := range mapFiles {
+	for _, mapFile := range mapFilesFiltered {
 		kva = append(kva, loadOne(mapFile)...)
 	}
 	sort.Sort(ByKey(kva))

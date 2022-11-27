@@ -18,7 +18,7 @@ import (
 )
 
 const taskTimeOut    = 10 * 1000 // 10s
-const channelTimeOut =  2 * 1000 //  2s
+const assignTimeOut  =  2 * 1000 //  2s
 
 type Coordinator struct {
 	// Your definitions here.
@@ -38,24 +38,26 @@ func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 	reply.NReduce = c.nReduce
 	// Can't use c.Done(), or dead lock occurs.
 	done := len(c.reduce_tasks) == 0
+
 	if !done {
-		var ok bool
+		ok := true
 		select {
 		case reply.Task_, ok = <- c.tasks_unassigned:
 			reply.Task_.processing = true
-		case <-time.After(channelTimeOut * time.Millisecond):
-			task := new(Task)
-			task.Type = FAKE
-			reply.Task_ = task
-			return nil
+		case <-time.After(assignTimeOut * time.Millisecond):
+			AssignFakeTask(reply)
 		}
 		assert.Assert(ok)
 	} else {
-		task := new(Task)
-		task.Type = FAKE
-		reply.Task_ = task
+		AssignFakeTask(reply)
 	}
 	return nil
+}
+
+func AssignFakeTask(reply *TaskReply) {
+	task := new(Task)
+	task.Type = FAKE
+	reply.Task_ = task
 }
 
 func (c *Coordinator) CompleteTask(args *TaskArgs, reply *TaskReply) error {
@@ -158,13 +160,6 @@ func (c *Coordinator) removeAllTempFiles() {
 	}
 }
 
-func max(a, b int) int {
-	if (a > b) {
-		return a
-	}
-	return b
-}
-
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -228,7 +223,7 @@ func MakeCoordinator(patterns []string, nReduce int) *Coordinator {
 	 */
 	c.tasks_unassigned = make(
 		chan *Task,
-		max(len(c.map_tasks), len(c.reduce_tasks)))
+		len(c.map_tasks) + len(c.reduce_tasks))
 	/**
 	 * Push map tasks into channel.
 	 * Reduce tasks will be pushed after map tasks are done
@@ -263,9 +258,9 @@ func (c *Coordinator) Tick(elapsed_ms int64) {
 				task.procTime = 0
 				task.processing = false
 				c.tasks_unassigned <- task
-				fmt.Println("\033[1;33m")
+				fmt.Printf("\033[1;33m")
 				fmt.Println("reassign:", task.Type, task.ID, task.InputName, task.OutputName)
-				fmt.Println("\033[0m")
+				fmt.Printf("\033[0m")
 			}
 		}
 	}
