@@ -20,12 +20,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	var elapsed_ms int64 = 50
-
 	m := mr.MakeCoordinator(os.Args[1:], 10)
-	for !m.Done() {
-		time.Sleep(time.Duration(elapsed_ms) * time.Millisecond)
-		m.Tick(elapsed_ms)
+	for m.Done() == false {
+		time.Sleep(time.Second)
+		m.Tick()
 	}
 	time.Sleep(time.Second)
 }
