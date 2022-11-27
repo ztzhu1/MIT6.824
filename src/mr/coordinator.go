@@ -35,6 +35,7 @@ type Coordinator struct {
 func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	reply.NReduce = c.nReduce
 	// Can't use c.Done(), or dead lock occurs.
 	done := len(c.reduce_tasks) == 0
 	if !done {
@@ -66,8 +67,10 @@ func (c *Coordinator) CompleteTask(args *TaskArgs, reply *TaskReply) error {
 		for i := 0; i < len(c.map_tasks); i++ {
 			if c.map_tasks[i].ID == args.TaskID {
 				// rename temp file
-				err := os.Rename(args.TempName, args.Name)
-				assert.Assert(err == nil)
+				for j, tempName := range args.TempNames {
+					err := os.Rename(tempName, args.Name + strconv.Itoa(j))
+					assert.Assert(err == nil)
+				}
 				// pop the task which was just completed
 				c.map_tasks = append(c.map_tasks[:i], c.map_tasks[i+1:]...)
 				break
@@ -84,8 +87,8 @@ func (c *Coordinator) CompleteTask(args *TaskArgs, reply *TaskReply) error {
 		for i := 0; i < len(c.reduce_tasks); i++ {
 			if c.reduce_tasks[i].ID == args.TaskID {
 				// rename temp file
-				if args.TempName != "" {
-					err := os.Rename(args.TempName, args.Name)
+				if args.TempNames[0] != "" {
+					err := os.Rename(args.TempNames[0], args.Name)
 					assert.Assert(err == nil)
 				}
 				// pop the task which was just completed
@@ -105,16 +108,16 @@ func (c *Coordinator) CompleteTask(args *TaskArgs, reply *TaskReply) error {
 
 // private method
 func (c *Coordinator) generateMapTasks(files []string) {
-	for _, file := range files {
+	for i, file := range files {
 		task := new(Task)
 		task.Type = MAP
-		task.ID = ihash(file)
+		task.ID = i
 		task.processing = false
 		task.procTime = 0
 
 		task.InputName  = file
-		task.OutputName = "mr-%v-%v"
-		task.OutputName = fmt.Sprintf(task.OutputName, task.ID, task.ID % c.nReduce)
+		task.OutputName = "mr-%v-"
+		task.OutputName = fmt.Sprintf(task.OutputName, task.ID)
 
 		c.map_tasks = append(c.map_tasks, task)
 	}
@@ -128,7 +131,8 @@ func (c *Coordinator) generateReduceTasks() {
 		task.processing = false
 		task.procTime = 0
 
-		task.InputName  = "mr-*-" + strconv.Itoa(i)
+		task.InputName  = "mr-*-%v"
+		task.InputName  = fmt.Sprintf(task.InputName, i)
 		task.OutputName = "mr-out-%v"
 		task.OutputName = fmt.Sprintf(task.OutputName, i)
 
@@ -259,7 +263,9 @@ func (c *Coordinator) Tick(elapsed_ms int64) {
 				task.procTime = 0
 				task.processing = false
 				c.tasks_unassigned <- task
+				fmt.Println("\033[1;33m")
 				fmt.Println("reassign:", task.Type, task.ID, task.InputName, task.OutputName)
+				fmt.Println("\033[0m")
 			}
 		}
 	}

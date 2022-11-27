@@ -60,20 +60,21 @@ func Worker(mapf func(string, string) []KeyValue,
 		fmt.Println(task.Type, task.ID, task.InputName, task.OutputName)
 		if task.Type == MAP {
 			contentPtr := read(task.InputName)
-			ofileTempName := mapHelper(task.InputName,
-									   task.OutputName,
-									   contentPtr,
-									   mapf)
+			ofileTempNames := mapHelper(task.InputName,
+									    task.OutputName,
+									    contentPtr,
+									    reply.NReduce,
+									    mapf)
 			// notify the coordinator this worker has
 			// completed its task
-			notify(task, &ofileTempName, &args, &reply)
+			notify(task, ofileTempNames, &args, &reply)
 		} else if task.Type == REDUCE {
-			ofileTempName := reduceHelper(task.InputName,
-										  task.OutputName,	
-										  reducef)
+			ofileTempNames := reduceHelper(task.InputName,
+										   task.OutputName,	
+										   reducef)
 			// notify the coordinator this worker has
 			// completed its task
-			notify(task, &ofileTempName, &args, &reply)
+			notify(task, ofileTempNames, &args, &reply)
 		} else {
 			cond = false
 		}
@@ -124,27 +125,45 @@ func read(filename string) *string {
 func mapHelper(inputName  string,
 			   outputName string,
 			   contentPtr *string,
-			   mapf func(string, string) []KeyValue) string {
+			   nReduce    int,
+			   mapf func(string, string) []KeyValue) *[]string {
 	kva := mapf(inputName, *contentPtr)
 	sort.Sort(ByKey(kva))
 
-	ofile, _ := os.CreateTemp("./", outputName + "-")
-	enc := json.NewEncoder(ofile)
-
-	for _, kv := range kva {
-		enc.Encode(&kv)
+	var ofiles     []*os.File
+	var encs       []*json.Encoder
+	var tempNames  []string
+	// create temp files
+	for i := 0; i < nReduce; i++ {
+		ofile, _ := os.CreateTemp("./", outputName + strconv.Itoa(i) + "-")
+		enc := json.NewEncoder(ofile)
+		ofiles = append(ofiles, ofile)
+		encs = append(encs, enc)
+		tempNames = append(tempNames, ofile.Name())
 	}
-	ofile.Close()
 
-	return ofile.Name()
+	// write
+	for _, kv := range kva {
+		i := reduceIdx(kv.Key, nReduce)
+		encs[i].Encode(&kv)
+	}
+
+	// close files
+	for _, ofile := range ofiles {
+		ofile.Close()
+	}
+
+	return &tempNames
 }
 
 func reduceHelper(inputPattern string,
 				  outputName string,
-				  reducef func(string, []string) string) string {
+				  reducef func(string, []string) string) *[]string {
+	var tempNames []string
+
 	mapFiles, _ := filepath.Glob(inputPattern)
 	if mapFiles == nil {
-		return ""
+		return &tempNames
 	}
 
 	kva := []KeyValue{}
@@ -174,7 +193,8 @@ func reduceHelper(inputPattern string,
 
 	ofile.Close()
 
-	return ofile.Name()
+	tempNames = append(tempNames, ofile.Name())
+	return &tempNames
 }
 
 func reduceOne(mapFile string, reducef func(string, []string) string) []KeyValue {
@@ -216,12 +236,16 @@ func reduceOne(mapFile string, reducef func(string, []string) string) []KeyValue
 	return result
 }
 
+func reduceIdx(key string, nReduce int) int {
+	return ihash(key) % nReduce
+}
+
 func notify(task *Task,
-			ofileTempName *string,
+			ofileTempNames *[]string,
 			args *TaskArgs,
 			reply *TaskReply) {
 	args.TaskID = task.ID
-	args.TempName = *ofileTempName
+	args.TempNames = *ofileTempNames
 	args.Name = task.OutputName
 	ok := call("Coordinator.CompleteTask", args, reply)
 	assert.Assert(ok)

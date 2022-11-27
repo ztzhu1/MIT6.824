@@ -24,13 +24,14 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 type TaskArgs struct {
-	TaskID   int
-	TempName string
-	Name     string
+	TaskID    int
+	TempNames []string
+	Name      string
 }
 
 type TaskReply struct {
-	Task_ *Task
+	NReduce int
+	Task_   *Task
 }
 
 // Cook up a unique-ish UNIX-domain socket name
