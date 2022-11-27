@@ -18,7 +18,7 @@ import (
 )
 
 const taskTimeOut    = 10 * 1000 // 10s
-const channelTimeOut =  5 * 1000 //  5s
+const channelTimeOut =  2 * 1000 //  2s
 
 type Coordinator struct {
 	// Your definitions here.
