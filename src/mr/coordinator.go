@@ -17,7 +17,7 @@ import (
 	"6.824/assert"
 )
 
-const taskTimeOut    =  4 * time.Second
+const taskTimeOut    = 10 * time.Second
 const assignTimeOut  =  2 * time.Second
 
 type Coordinator struct {
