@@ -27,5 +27,5 @@ func main() {
 		time.Sleep(time.Duration(elapsed_ms) * time.Millisecond)
 		m.Tick(elapsed_ms)
 	}
-
+	time.Sleep(time.Second)
 }

@@ -15,6 +15,7 @@ import "plugin"
 import "os"
 import "fmt"
 import "log"
+import "time"
 
 func main() {
 	if len(os.Args) != 2 {
@@ -25,6 +26,7 @@ func main() {
 	mapf, reducef := loadPlugin(os.Args[1])
 
 	mr.Worker(mapf, reducef)
+	time.Sleep(time.Second)
 }
 
 //
