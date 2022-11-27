@@ -13,4 +13,5 @@ worker: build
 	go run -race mrworker.go $(PLUGIN).so
 
 clean:
-	rm mr-out-*
+	rm -f mr-out-*
+	find . -maxdepth 1 -type f | egrep "mr-[0-9].*" | xargs rm
