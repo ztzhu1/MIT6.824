@@ -19,6 +19,24 @@ import "sync"
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
 
+func TestDummy2A(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false, false)
+	defer cfg.cleanup()
+
+	cfg.begin("Test (2A): dummy")
+
+	leader1 := cfg.checkOneLeader()
+	fmt.Printf("leader: %v\n", leader1)
+
+	// if the leader disconnects, a new one should be elected.
+	cfg.disconnect(leader1)
+	fmt.Printf("%v disconnected\n", leader1)
+	cfg.checkOneLeader()
+
+	cfg.end()
+}
+
 func TestInitialElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
