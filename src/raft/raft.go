@@ -135,7 +135,7 @@ func (rf *Raft) updateTerm(term int32) {
 	currTerm := rf.getCurrentTerm()
 	assert.Assert(term >= currTerm)
 	if term > currTerm {
-		rf.votedFor = -1
+		rf.unvote()
 	}
 	rf.setCurrentTerm(term)
 }
