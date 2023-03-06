@@ -69,6 +69,11 @@ const (
 	Leader
 )
 
+type Entry struct {
+	Cmd      interface{}
+	RecvTerm int32
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -86,6 +91,11 @@ type Raft struct {
 	state         PeerState
 	votedFor      int32
 	recvHeartBeat int32 // zero: false; non-zero: true
+	log           map[int]*Entry
+	commitIndex   int
+	lastApplied   int32
+	nextIndex     []int
+	matchIndex    []int
 }
 
 // ------ impl Raft ------
@@ -142,8 +152,8 @@ func (rf *Raft) updateTerm(term int32) {
 
 func (rf *Raft) setAll(term int32, state PeerState) {
 	rf.updateTerm(term)
-	rf.state = state
-	rf.recvHeartBeat = 1
+	rf.setPeerState(state)
+	rf.setHeartBeat(1)
 }
 
 func (rf *Raft) resetAll(term int32) {
@@ -172,10 +182,13 @@ func (rf *Raft) isFollower() bool {
 	return rf.getPeerState() == Follower
 }
 
-func (rf *Raft) leaderNotify() {
+func (rf *Raft) sendHeartBeat() {
 	assert.Assert(rf.isLeader())
 
-	args := AppendEntriesArgs{Term: rf.getCurrentTerm(), LearderId: int32(rf.me)}
+	args := AppendEntriesArgs{
+		Term:      rf.getCurrentTerm(),
+		LearderId: int32(rf.me),
+	}
 	for rf.isLeader() && !rf.killed() {
 		// fmt.Printf("%v(term %v) notifies all\n", rf.me, rf.currentTerm)
 		replies := make([]AppendEntriesReply, len(rf.peers))
@@ -199,6 +212,16 @@ func (rf *Raft) termOutOfDate(othersTerm int32) bool {
 		rf.resetAll(othersTerm)
 	}
 	return outOfDate
+}
+
+func (rf *Raft) initIndicesInLeader() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.nextIndex[i] = len(rf.log) + 1
+		rf.matchIndex[i] = 0
+	}
 }
 
 func (rf *Raft) elect() {
@@ -245,15 +268,14 @@ func (rf *Raft) elect() {
 	if rf.isFollower() {
 		// fmt.Printf("%v (term %v) fail, vote: %v\n", rf.me, rf.getCurrentTerm(), vote)
 		assert.Assert(rf.recvHeartBeat > 0)
-		return
 	} else if vote > len(rf.peers)/2 { // if win
 		rf.setPeerState(Leader)
 		rf.setHeartBeat(1)
 		fmt.Printf("%v (term %v) is leader now\n", rf.me, rf.currentTerm)
-		rf.leaderNotify()
+		go rf.sendHeartBeat()
+		rf.initIndicesInLeader()
 	} else { // votes are split, no one wins
 		rf.setHeartBeat(1)
-		return
 	}
 }
 
@@ -323,8 +345,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int32
-	CandidateId int32
+	Term         int32
+	CandidateId  int32
+	LastLogIndex int32
+	LastLogTerm  int32
 }
 
 //
@@ -353,8 +377,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.setPeerState(Follower)
 		rf.setHeartBeat(1)
 		rf.setCurrentTerm(args.Term)
-	} else if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
-		// follower in the same term with requester
+	} else if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		// follower is in the same term with requester and hasn't voted
 		reply.VoteGranted = true
 		rf.setVotedFor(args.CandidateId)
 		rf.setPeerState(Follower)
@@ -397,22 +421,54 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 type AppendEntriesArgs struct {
-	Term      int32
-	LearderId int32
+	Term         int32
+	LearderId    int32
+	PrevLogIndex int
+	PrevLogTerm  int32
+	Entries      map[int]*Entry
+	LeaderCommit int32
 }
 
 type AppendEntriesReply struct {
-	Term int32
+	Term    int32
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	currTerm := rf.getCurrentTerm()
 	reply.Term = currTerm
+	reply.Success = false
 
-	// fmt.Printf("%v(term %v) received %v(term %v)\n", rf.me, currTerm, args.LearderId, args.Term)
-	if args.Term >= currTerm {
-		rf.resetAll(args.Term)
+	if args.Term < currTerm {
+		return
 	}
+	// fmt.Printf("%v(term %v) received %v(term %v)\n", rf.me, currTerm, args.LearderId, args.Term)
+
+	// heart beat
+	rf.resetAll(args.Term)
+	// replicate log
+	logLen := len(rf.log)
+	if logLen < args.PrevLogIndex {
+		return
+	} else if logLen != 0 && args.PrevLogIndex != 0 && rf.log[args.PrevLogIndex].RecvTerm != args.PrevLogTerm {
+		return
+	}
+	// now leader and follower reach an agreement
+	if len(rf.log) > args.PrevLogIndex {
+		// clear entries that leader doesn't record
+		for i := args.PrevLogIndex + 1; i <= len(rf.log); i++ {
+			delete(rf.log, i)
+		}
+	}
+	assert.Assert(len(rf.log) == args.PrevLogIndex)
+	// ready to insert
+	for k, v := range args.Entries {
+		rf.log[k] = &Entry{
+			Cmd:      v.Cmd,
+			RecvTerm: v.RecvTerm,
+		}
+	}
+	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -435,13 +491,65 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
+	// Your code here (2B).
+	if !rf.isLeader() {
+		return -1, -1, false
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	index := len(rf.log) + 1
+	for k, v := range rf.log {
+		fmt.Printf("key: %v, value: %v\n", k, v)
+	}
+	term := rf.getCurrentTerm()
 	isLeader := true
 
-	// Your code here (2B).
+	// append entry to leader's log
+	rf.log[index] = &Entry{
+		Cmd:      command,
+		RecvTerm: int32(term),
+	}
+	// send entry to every peer
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go rf.appendEntryToOnePeer(i, term, index)
+	}
 
-	return index, term, isLeader
+	return index, int(term), isLeader
+}
+
+func (rf *Raft) appendEntryToOnePeer(server int, term int32, index int) {
+	args := AppendEntriesArgs{
+		Term:         term,
+		LearderId:    int32(rf.me),
+		PrevLogIndex: index - 1,
+		Entries:      map[int]*Entry{},
+	}
+	if index-1 != 0 {
+		args.PrevLogTerm = rf.log[index-1].RecvTerm
+	}
+
+	initIndex := index
+
+	for !rf.killed() && rf.isLeader() {
+		args.Entries[index] = rf.log[index]
+		reply := AppendEntriesReply{}
+		rf.sendAppendEntries(server, &args, &reply)
+		if !reply.Success {
+			index--
+			args.PrevLogIndex--
+			if args.PrevLogIndex > 0 {
+				args.PrevLogTerm = rf.log[index-1].RecvTerm
+			}
+		} else {
+			rf.matchIndex[server] = initIndex
+			break
+		}
+	}
 }
 
 //
@@ -475,6 +583,9 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 
 		// fmt.Printf("node %v, term %v, leader: %v\n", rf.me, rf.currentTerm, rf.isLeader())
+		if rf.isLeader() {
+			continue
+		}
 		if rf.getHeartBeat() > 0 {
 			randSleep()
 			continue
@@ -507,6 +618,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.votedFor = -1 // nil
 	rf.recvHeartBeat = 1
+	rf.log = map[int]*Entry{}
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
