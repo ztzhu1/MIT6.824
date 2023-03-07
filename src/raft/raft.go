@@ -96,6 +96,7 @@ type Raft struct {
 	lastApplied   int32
 	nextIndex     []int
 	matchIndex    []int
+	applyCh       chan ApplyMsg
 }
 
 // ------ impl Raft ------
@@ -186,11 +187,13 @@ func (rf *Raft) sendHeartBeat() {
 	assert.Assert(rf.isLeader())
 
 	args := AppendEntriesArgs{
-		Term:      rf.getCurrentTerm(),
-		LearderId: int32(rf.me),
+		Term:        rf.getCurrentTerm(),
+		LearderId:   int32(rf.me),
+		IsHeartBeat: true,
 	}
 	for rf.isLeader() && !rf.killed() {
 		// fmt.Printf("%v(term %v) notifies all\n", rf.me, rf.currentTerm)
+		args.LeaderCommit = rf.commitIndex
 		replies := make([]AppendEntriesReply, len(rf.peers))
 		for i := 0; i < len(replies); i++ {
 			if i == rf.me {
@@ -426,7 +429,8 @@ type AppendEntriesArgs struct {
 	PrevLogIndex int
 	PrevLogTerm  int32
 	Entries      map[int]*Entry
-	LeaderCommit int32
+	LeaderCommit int
+	IsHeartBeat  bool
 }
 
 type AppendEntriesReply struct {
@@ -446,6 +450,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// heart beat
 	rf.resetAll(args.Term)
+	if rf.commitIndex < args.LeaderCommit {
+		rf.commitTo(args.LeaderCommit)
+	}
+	if args.IsHeartBeat {
+		return
+	}
 	// replicate log
 	logLen := len(rf.log)
 	if logLen < args.PrevLogIndex {
@@ -463,6 +473,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	assert.Assert(len(rf.log) == args.PrevLogIndex)
 	// ready to insert
 	for k, v := range args.Entries {
+		// fmt.Printf("%v(term %v, leader: %v): %v, %v\n", rf.me, rf.currentTerm, rf.isLeader(), k, *v)
 		rf.log[k] = &Entry{
 			Cmd:      v.Cmd,
 			RecvTerm: v.RecvTerm,
@@ -500,9 +511,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 
 	index := len(rf.log) + 1
-	for k, v := range rf.log {
-		fmt.Printf("key: %v, value: %v\n", k, v)
-	}
 	term := rf.getCurrentTerm()
 	isLeader := true
 
@@ -528,6 +536,7 @@ func (rf *Raft) appendEntryToOnePeer(server int, term int32, index int) {
 		LearderId:    int32(rf.me),
 		PrevLogIndex: index - 1,
 		Entries:      map[int]*Entry{},
+		IsHeartBeat:  false,
 	}
 	if index-1 != 0 {
 		args.PrevLogTerm = rf.log[index-1].RecvTerm
@@ -547,8 +556,42 @@ func (rf *Raft) appendEntryToOnePeer(server int, term int32, index int) {
 			}
 		} else {
 			rf.matchIndex[server] = initIndex
+			rf.checkReadyToCommit(index)
 			break
 		}
+	}
+}
+
+func (rf *Raft) checkReadyToCommit(index int) {
+	if rf.commitIndex >= index {
+		return
+	}
+
+	replicatedNum := 1
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		if rf.matchIndex[i] >= index {
+			replicatedNum++
+		}
+		// the majority of peers have replicated the log,
+		// ready to commit
+		if replicatedNum > len(rf.peers)/2 {
+			rf.commitTo(index)
+			break
+		}
+	}
+}
+
+func (rf *Raft) commitTo(index int) {
+	for j := rf.commitIndex + 1; j <= min(index, len(rf.log)); j++ {
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[j].Cmd,
+			CommandIndex: j,
+		}
+		rf.commitIndex++
 	}
 }
 
@@ -623,6 +666,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -655,4 +699,11 @@ func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
 	case <-time.After(timeout):
 		return true // timed out
 	}
+}
+
+func min(a int, b int) int {
+	if a > b {
+		return b
+	}
+	return a
 }
