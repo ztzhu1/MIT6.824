@@ -30,9 +30,14 @@ func TestDummy2A(t *testing.T) {
 	fmt.Printf("leader: %v\n", leader1)
 
 	// if the leader disconnects, a new one should be elected.
-	cfg.disconnect(leader1)
-	fmt.Printf("%v disconnected\n", leader1)
+	cfg.disconnect((leader1 + 1) % servers)
+	fmt.Printf("follower %v disconnected\n", (leader1+1)%servers)
 	cfg.checkOneLeader()
+	time.Sleep(1000 * time.Millisecond)
+
+	cfg.connect((leader1 + 1) % servers)
+	fmt.Printf("follower %v connected\n", (leader1+1)%servers)
+	time.Sleep(1000 * time.Millisecond)
 
 	cfg.end()
 }
@@ -304,6 +309,7 @@ func TestFailAgree2B(t *testing.T) {
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
 	cfg.disconnect((leader + 1) % servers)
+	fmt.Printf("%v disconnected\n", (leader+1)%servers)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
@@ -315,6 +321,7 @@ func TestFailAgree2B(t *testing.T) {
 
 	// re-connect
 	cfg.connect((leader + 1) % servers)
+	fmt.Printf("%v connected\n", (leader+1)%servers)
 
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
@@ -340,6 +347,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.disconnect((leader + 1) % servers)
 	cfg.disconnect((leader + 2) % servers)
 	cfg.disconnect((leader + 3) % servers)
+	fmt.Printf("%v %v %v disconnected\n", (leader+1)%servers, (leader+2)%servers, (leader+3)%servers)
 
 	index, _, ok := cfg.rafts[leader].Start(20)
 	if ok != true {
@@ -360,6 +368,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
+	fmt.Printf("%v %v %v re-connected\n", (leader+1)%servers, (leader+2)%servers, (leader+3)%servers)
 
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
@@ -490,6 +499,8 @@ func TestRejoin2B(t *testing.T) {
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect(leader1)
+	fmt.Printf("leader %v disconnected\n", leader1)
+	fmt.Printf("survive: %v, %v\n", (leader1+1)%servers, (leader1+2)%servers)
 
 	// make old leader try to agree on some entries
 	cfg.rafts[leader1].Start(102)
@@ -502,14 +513,24 @@ func TestRejoin2B(t *testing.T) {
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
 	cfg.disconnect(leader2)
+	fmt.Printf("leader %v disconnected\n", leader2)
+	fmt.Printf("survive: ")
+	for i := 0; i < servers; i++ {
+		if i != leader1 && i != leader2 {
+			fmt.Printf("%v ", i)
+		}
+	}
+	fmt.Printf("\n")
 
 	// old leader connected again
 	cfg.connect(leader1)
+	fmt.Printf("%v re-connected\n", leader1)
 
 	cfg.one(104, 2, true)
 
 	// all together now
 	cfg.connect(leader2)
+	fmt.Printf("%v re-connected\n", leader2)
 
 	cfg.one(105, servers, true)
 
