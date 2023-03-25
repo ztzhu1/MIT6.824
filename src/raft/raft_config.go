@@ -6,9 +6,9 @@ import (
 
 const TickInterval = 20 * time.Millisecond
 
-const CandidateTimeout = 200 * time.Millisecond
+const CandidateTimeout = 140 * time.Millisecond
 
-const ElectionTimeout = 500 * time.Millisecond
+const ElectionTimeout = 300 * time.Millisecond
 const HeartBeatTimeout = 100 * time.Millisecond
 
 const ElectionTimeoutNorm = int64(ElectionTimeout / TickInterval)
