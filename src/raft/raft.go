@@ -40,7 +40,7 @@ type lockedRand struct {
 
 func (r *lockedRand) randTimeout(baseTimeout int64) int64 {
 	r.mu.Lock()
-	v := r.rand.Int63n(baseTimeout)
+	v := r.rand.Int63n(2 * baseTimeout)
 	r.mu.Unlock()
 	return baseTimeout + v
 }
@@ -202,14 +202,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.term
+	reply.Success = false
 	switch {
 	case args.Type == MsgHeartBeat:
 		if args.LeaderTerm < rf.term {
-			reply.Success = false
-		} else {
+			return
+		}
+		assert.Assert(rf.term < args.LeaderTerm || rf.state != StateLeader)
+		reply.Success = true
+		rf.resetElectionElapsed()
+		if rf.term < args.LeaderTerm {
+			rf.setState(StateFollower)
+			rf.tick = rf.tickFollower
 			rf.term = args.LeaderTerm
-			rf.resetElectionElapsed()
-			reply.Success = true
 		}
 	default:
 		panic("unreachable")
@@ -348,26 +353,40 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) tickFollower() {
-	// rf.checkFollower()
-	if rf.state != StateFollower {
+	if !rf.isFollower() {
 		return
 	}
+	// If the node is follower, there is no another goroutine
+	// to prompt it to pre-candidate, so we can assum it's
+	// always a follower until `rf.campaign`.
 
 	if rf.incElectionElapsed(1) < rf.electionTimeout {
 		return
 	}
 	rf.resetElectionElapsed()
+
+	if rf.votedTerm > rf.term {
+		return
+	}
+
 	rf.campaign(CampaignPreCandidate)
 }
 
 func (rf *Raft) tickLeader() {
-	rf.checkLeader()
+	rf.mu.Lock()
+	if !rf.isLeader() {
+		rf.mu.Unlock()
+		return
+	}
 
 	if rf.incHBElapsed(1) < rf.heartBeatTimeout {
+		rf.mu.Unlock()
 		return
 	}
 	rf.resetHBElapsed()
-	rf.bcastHeartBeat()
+	leaderTerm := rf.term
+	rf.mu.Unlock()
+	rf.bcastHeartBeat(leaderTerm)
 }
 
 // -------- state --------
@@ -385,18 +404,22 @@ func (rf *Raft) becomeFollower() {
 	DPrintf("%v(term %v) becomes follower", rf.id, rf.term)
 }
 
-func (rf *Raft) becomePreCandidate() {
+func (rf *Raft) becomePreCandidate() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.checkFollower()
 	rf.state = StatePreCandidate
 	DPrintf("%v(term %v) becomes pre-candidate", rf.id, rf.term)
+	return rf.term
 }
 
 func (rf *Raft) becomeCandidate() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.checkPreCandidate()
+	if !rf.isPreCandidate() {
+		assert.Assert(rf.isFollower())
+		return
+	}
 	rf.state = StateCandidate
 	rf.term++
 	DPrintf("%v(term %v) becomes candidate", rf.id, rf.term)
@@ -410,12 +433,12 @@ func (rf *Raft) becomeLeader() {
 	rf.resetHBElapsed()
 	rf.tick = rf.tickLeader
 	DPrintf("%v(term %v) becomes leader", rf.id, rf.term)
-	rf.bcastHeartBeat()
+	rf.bcastHeartBeat(rf.term)
 }
 
 func (rf *Raft) resetTimeout() {
 	rf.electionTimeout = globalRand.randTimeout(ElectionTimeoutNorm)
-	rf.heartBeatTimeout = globalRand.randTimeout(HeartBeatTimeoutNorm)
+	rf.heartBeatTimeout = HeartBeatTimeoutNorm
 
 	rf.resetElectionElapsed()
 	rf.resetHBElapsed()
@@ -440,18 +463,18 @@ func (rf *Raft) canVoteFor(which int, termOfWhich int) bool {
 		// only followers can vote, except when voting for self
 		return false
 	}
-	if rf.votedTerm > termOfWhich {
-		// `which` is out-of-date
-		return false
-	}
 	if rf.votedTerm < termOfWhich {
 		// `which` is newer
 		rf.votedFor = which
 		rf.votedTerm = termOfWhich
 		return true
 	}
+	if rf.votedTerm > termOfWhich {
+		// `which` is out-of-date
+		return false
+	}
 	// `rf.votedTerm` == `termOfWhich`, only can vote for self
-	if rf.votedFor == rf.id {
+	if rf.votedFor == which {
 		return true
 	}
 	return false
@@ -461,18 +484,17 @@ func (rf *Raft) canVoteFor(which int, termOfWhich int) bool {
 
 func (rf *Raft) campaign(t CampaignType) {
 	replyCh := make(chan RequestVoteReply, len(rf.peers))
-	rf.mu.Lock()
-	if rf.votedTerm > rf.term {
-		rf.mu.Unlock()
-		return
-	}
-	rf.mu.Unlock()
 
 	switch {
 	case t == CampaignPreCandidate:
-		rf.becomePreCandidate()
-		rf.bcastRequestVote(replyCh)
+		candTerm := rf.becomePreCandidate() + 1
+		rf.bcastRequestVote(replyCh, candTerm)
 		success, _ := rf.campaignSuccess(replyCh)
+		if rf.isFollower() {
+			// State transition may happen at any
+			// unprotected time due to `AppendEntries`.
+			return
+		}
 		if success {
 			rf.becomeCandidate()
 			rf.campaign(CampaignCandidate)
@@ -482,16 +504,22 @@ func (rf *Raft) campaign(t CampaignType) {
 	case t == CampaignCandidate:
 		DPrintf("%v(term %v) campaigning", rf.id, rf.term)
 		rf.mu.Lock()
-		assert.Assert(rf.state != StatePreCandidate)
-		assert.Assert(rf.state != StateLeader)
-		if rf.state == StateFollower {
+		assert.Assert(!rf.isPreCandidate())
+		assert.Assert(!rf.isLeader())
+		if rf.isFollower() {
 			rf.mu.Unlock()
 			return
 		}
+		candTerm := rf.term
 		rf.mu.Unlock()
 
-		rf.bcastRequestVote(replyCh)
+		rf.bcastRequestVote(replyCh, candTerm)
 		success, timeout := rf.campaignSuccess(replyCh)
+		if rf.isFollower() {
+			// State transition may happen at any
+			// unprotected time due to `AppendEntries`.
+			return
+		}
 		if success {
 			rf.becomeLeader()
 			// TODO (ztzhu): do something else
@@ -523,30 +551,25 @@ func (rf *Raft) campaignSuccess(replyCh chan RequestVoteReply) (success bool, ti
 	return grantedNum > half, false
 }
 
-func (rf *Raft) bcastRequestVote(replyCh chan RequestVoteReply) {
-	rf.checkPreCandOrCand()
+func (rf *Raft) bcastRequestVote(replyCh chan RequestVoteReply, candTerm int) {
 	for id := 0; id < len(rf.peers); id++ {
-		rf.requestVote(id, replyCh)
+		go rf.requestVote(id, replyCh, candTerm)
 	}
 }
 
-func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply) {
-	rf.checkPreCandOrCand()
-	term := rf.term
-	if rf.state == StatePreCandidate {
-		term++
+func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply, candTerm int) {
+	if rf.isFollower() {
+		return
 	}
 	// it can vote for self directly
 	if rf.id == to {
-		DPrintf("123")
-		rf.recordVoteFor(rf.id, rf.term)
-		DPrintf("456")
-		replyCh <- RequestVoteReply{term, true}
+		rf.recordVoteFor(rf.id, candTerm)
+		replyCh <- RequestVoteReply{candTerm, true}
 		return
 	}
 
 	args := &RequestVoteArgs{
-		Term: term,
+		Term: candTerm,
 		From: rf.id,
 	}
 	reply := &RequestVoteReply{}
@@ -556,18 +579,20 @@ func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply) {
 	}
 }
 
-func (rf *Raft) bcastHeartBeat() {
+func (rf *Raft) bcastHeartBeat(leaderTerm int) {
 	for id := 0; id < len(rf.peers); id++ {
 		if id != rf.id {
-			rf.sendHeartBeat(id)
+			go rf.sendHeartBeat(id, leaderTerm)
 		}
 	}
 }
 
-func (rf *Raft) sendHeartBeat(to int) {
-	rf.checkLeader()
+func (rf *Raft) sendHeartBeat(to int, leaderTerm int) {
+	if !rf.isLeader() {
+		return
+	}
 	args := &AppendEntriesArgs{
-		LeaderTerm: rf.term,
+		LeaderTerm: leaderTerm,
 		LeaderId:   rf.id,
 		Type:       MsgHeartBeat,
 	}
@@ -620,19 +645,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 // Caller should ensure that rf already holds mu.
 func (rf *Raft) checkFollower() {
 	assert.Assert(!rf.killed())
-	assert.Assert(rf.state == StateFollower)
+	assert.Assert(rf.isFollower())
 }
 
 // Caller should ensure that rf already holds mu.
 func (rf *Raft) checkPreCandidate() {
 	assert.Assert(!rf.killed())
-	assert.Assert(rf.state == StatePreCandidate)
+	assert.Assert(rf.isPreCandidate())
 }
 
 // Caller should ensure that rf already holds mu.
 func (rf *Raft) checkCandidate() {
 	assert.Assert(!rf.killed())
-	assert.Assert(rf.state == StateCandidate)
+	assert.Assert(rf.isCandidate())
 	assert.Assert(rf.term > 0)
 }
 
@@ -650,7 +675,7 @@ func (rf *Raft) checkPreCandOrCand() {
 // Caller should ensure that rf already holds mu.
 func (rf *Raft) checkLeader() {
 	assert.Assert(!rf.killed())
-	assert.Assert(rf.state == StateLeader)
+	assert.Assert(rf.isLeader())
 	assert.Assert(rf.term > 0)
 }
 
@@ -669,6 +694,14 @@ func (rf *Raft) incHBElapsed(delta int64) (new int64) {
 	return atomic.AddInt64(&rf.heartBeatElapsed, delta)
 }
 
+func (rf *Raft) resetElectionElapsed() {
+	atomic.StoreInt64(&rf.electionElapsed, 0)
+}
+
+func (rf *Raft) resetHBElapsed() {
+	atomic.StoreInt64(&rf.heartBeatElapsed, 0)
+}
+
 func (rf *Raft) getElectionElapsed() int64 {
 	return atomic.LoadInt64(&rf.electionElapsed)
 }
@@ -677,10 +710,22 @@ func (rf *Raft) getHBElapsed() int64 {
 	return atomic.LoadInt64(&rf.heartBeatElapsed)
 }
 
-func (rf *Raft) resetElectionElapsed() {
-	atomic.StoreInt64(&rf.electionElapsed, 0)
+func (rf *Raft) setState(state RaftState) {
+	atomic.StoreInt32((*int32)(&rf.state), int32(state))
 }
 
-func (rf *Raft) resetHBElapsed() {
-	atomic.StoreInt64(&rf.heartBeatElapsed, 0)
+func (rf *Raft) isFollower() bool {
+	return atomic.LoadInt32((*int32)(&rf.state)) == int32(StateFollower)
+}
+
+func (rf *Raft) isPreCandidate() bool {
+	return atomic.LoadInt32((*int32)(&rf.state)) == int32(StatePreCandidate)
+}
+
+func (rf *Raft) isCandidate() bool {
+	return atomic.LoadInt32((*int32)(&rf.state)) == int32(StateCandidate)
+}
+
+func (rf *Raft) isLeader() bool {
+	return atomic.LoadInt32((*int32)(&rf.state)) == int32(StateLeader)
 }
