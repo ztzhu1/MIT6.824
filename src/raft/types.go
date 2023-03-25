@@ -1,7 +1,7 @@
 package raft
 
 // ------ RaftState ------
-type RaftState int
+type RaftState int32
 
 const (
 	StateFollower RaftState = iota
