@@ -13,3 +13,5 @@ const HeartBeatTimeout = 100 * time.Millisecond
 
 const ElectionTimeoutNorm = int64(ElectionTimeout / TickInterval)
 const HeartBeatTimeoutNorm = int64(HeartBeatTimeout / TickInterval)
+
+const AppendWaitTime = 50 * time.Millisecond
