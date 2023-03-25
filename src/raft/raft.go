@@ -26,7 +26,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
-	"6.824/assert"
+	. "6.824/assert"
 	"6.824/labrpc"
 )
 
@@ -91,6 +91,11 @@ type Raft struct {
 	term      int
 	votedFor  int
 	votedTerm int
+
+	entries     map[int]Entry
+	commitIndex int
+	nextIndex   []int
+	matchIndex  []int
 
 	electionTimeout  int64
 	heartBeatTimeout int64
@@ -192,14 +197,19 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // -------- AppendEntries --------
 
 type AppendEntriesArgs struct {
-	LeaderTerm int
-	LeaderId   int
-	Type       MsgType
+	Type         MsgType
+	LeaderTerm   int
+	LeaderId     int
+	LeaderCommit int
+	PrevLogIdx   int
+	PrevLogTerm  int
+	Entries      map[int]Entry
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term              int
+	Success           bool
+	FollowerEntrySize int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -207,17 +217,48 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Term = rf.term
 	reply.Success = false
+	reply.FollowerEntrySize = len(rf.entries)
+	if args.LeaderTerm < rf.term {
+		// old leader
+		return
+	}
+
+	Assert(rf.term < args.LeaderTerm || rf.state != StateLeader)
+	rf.resetElectionElapsed()
+	rf.setState(StateFollower)
+	rf.tick = rf.tickFollower
+	rf.term = args.LeaderTerm
 	switch {
 	case args.Type == MsgHeartBeat:
-		if args.LeaderTerm < rf.term {
-			return
-		}
-		assert.Assert(rf.term < args.LeaderTerm || rf.state != StateLeader)
 		reply.Success = true
-		rf.resetElectionElapsed()
-		rf.setState(StateFollower)
-		rf.tick = rf.tickFollower
-		rf.term = args.LeaderTerm
+		rf.followerTryToCommitUntil(args.LeaderCommit, args.LeaderTerm)
+	case args.Type == MsgAppend:
+		size := len(rf.entries)
+		prev := args.PrevLogIdx
+		if prev == 0 || (size >= prev && rf.entries[prev].Term == args.PrevLogTerm) {
+			// append entries to follower
+			i := prev + 1
+			for ; i <= prev+len(args.Entries); i++ {
+				entry, exist := rf.entries[i]
+				if exist && entry.AppendTerm >= args.LeaderTerm {
+					// The entry is appended by a up-to-date leader, may be
+					// the caller itself, so we can ignore it.
+					continue
+				}
+				rf.entries[i] = args.Entries[i]
+			}
+			for ; i <= size; i++ {
+				entry, exist := rf.entries[i]
+				if exist && entry.AppendTerm >= args.LeaderTerm {
+					// the latter entries must be at least as
+					// up-to-date as leader's entries
+					break
+				}
+				delete(rf.entries, i)
+			}
+			reply.FollowerEntrySize = len(rf.entries)
+			reply.Success = true
+		}
 	default:
 		panic("unreachable")
 	}
@@ -302,13 +343,22 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	index := len(rf.entries) + 1
+	Assert(rf.commitIndex < index)
+	term := rf.term
+
+	if !rf.isLeader() || rf.killed() {
+		return -1, -1, false
+	}
+
+	rf.entries[index] = Entry{command, rf.term, rf.term}
+	rf.bcastAppendEntries(term, rf.commitIndex, index)
+
+	return index, term, true
 }
 
 //
@@ -342,8 +392,7 @@ func (rf *Raft) ticker() {
 	}
 	ticker_ := time.NewTicker(TickInterval)
 	defer ticker_.Stop()
-	for {
-		<-ticker_.C
+	for range ticker_.C {
 		if rf.killed() {
 			DWarning("%v(term %v) killed", rf.id, rf.term)
 			return
@@ -384,8 +433,9 @@ func (rf *Raft) tickLeader() {
 	}
 	rf.resetHBElapsed()
 	leaderTerm := rf.term
+	leaderCommit := rf.commitIndex
 	rf.mu.Unlock()
-	rf.bcastHeartBeat(leaderTerm)
+	rf.bcastHeartBeat(leaderTerm, leaderCommit)
 }
 
 // -------- state --------
@@ -393,7 +443,7 @@ func (rf *Raft) tickLeader() {
 func (rf *Raft) becomeFollower() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	assert.Assert(rf.state != StateFollower)
+	Assert(rf.state != StateFollower)
 	rf.state = StateFollower
 	rf.resetVoteFor()
 
@@ -416,7 +466,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if !rf.isPreCandidate() {
-		assert.Assert(rf.isFollower())
+		Assert(rf.isFollower())
 		return
 	}
 	rf.state = StateCandidate
@@ -427,12 +477,19 @@ func (rf *Raft) becomeCandidate() {
 func (rf *Raft) becomeLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	assert.Assert(rf.state == StateCandidate)
-	rf.state = StateLeader
+	Assert(rf.state == StateCandidate)
+	rf.setState(StateLeader)
+	DPrintf("%v(term %v) becomes leader", rf.id, rf.term)
 	rf.resetHBElapsed()
 	rf.tick = rf.tickLeader
-	DPrintf("%v(term %v) becomes leader", rf.id, rf.term)
-	rf.bcastHeartBeat(rf.term)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.id {
+			continue
+		}
+		rf.nextIndex[i] = len(rf.entries) + 1
+		rf.matchIndex[i] = 0
+	}
+	rf.bcastHeartBeat(rf.term, rf.commitIndex)
 }
 
 func (rf *Raft) resetTimeout() {
@@ -451,7 +508,7 @@ func (rf *Raft) resetVoteFor() {
 
 // caller should have acquired the lock
 func (rf *Raft) recordVoteFor(which int, termOfWhich int) {
-	assert.Assert(rf.canVoteFor(which, termOfWhich))
+	Assert(rf.canVoteFor(which, termOfWhich))
 	rf.votedFor = which
 	rf.votedTerm = termOfWhich
 }
@@ -477,6 +534,9 @@ func (rf *Raft) canVoteFor(which int, termOfWhich int) bool {
 	return false
 }
 
+// func (rf *Raft) upToDateThan(which int, termOfWhich int) bool {
+// }
+
 // -------- actions --------
 
 func (rf *Raft) campaign(t CampaignType) {
@@ -501,8 +561,8 @@ func (rf *Raft) campaign(t CampaignType) {
 	case t == CampaignCandidate:
 		DPrintf("%v(term %v) campaigning", rf.id, rf.term)
 		rf.mu.Lock()
-		assert.Assert(!rf.isPreCandidate())
-		assert.Assert(!rf.isLeader())
+		Assert(!rf.isPreCandidate())
+		Assert(!rf.isLeader())
 		if rf.isFollower() {
 			DWarning("%v(term %v) steps down to follower, stop campaigning", rf.id, rf.term)
 			rf.mu.Unlock()
@@ -521,7 +581,7 @@ func (rf *Raft) campaign(t CampaignType) {
 		}
 		if success {
 			rf.becomeLeader()
-			// TODO (ztzhu): do something else
+			// TODO (ztzhu): do something useful after becoming leader
 		} else if timeout {
 			// re-elect
 			DWarning("%v(term %v) timeout, re-campaign", rf.id, rf.term)
@@ -587,25 +647,147 @@ func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply, candTerm int,
 	}
 }
 
-func (rf *Raft) bcastHeartBeat(leaderTerm int) {
+func (rf *Raft) bcastHeartBeat(leaderTerm int, leaderCommit int) {
 	for id := 0; id < len(rf.peers); id++ {
 		if id != rf.id {
-			go rf.sendHeartBeat(id, leaderTerm)
+			go rf.sendHeartBeat(id, leaderTerm, leaderCommit)
 		}
 	}
 }
 
-func (rf *Raft) sendHeartBeat(to int, leaderTerm int) {
+func (rf *Raft) sendHeartBeat(to int, leaderTerm int, leaderCommit int) {
 	if !rf.isLeader() {
 		return
 	}
 	args := &AppendEntriesArgs{
-		LeaderTerm: leaderTerm,
-		LeaderId:   rf.id,
-		Type:       MsgHeartBeat,
+		Type:         MsgHeartBeat,
+		LeaderTerm:   leaderTerm,
+		LeaderId:     rf.id,
+		LeaderCommit: leaderCommit,
 	}
 	reply := &AppendEntriesReply{}
 	rf.sendAppendEntries(to, args, reply)
+}
+
+func (rf *Raft) bcastAppendEntries(leaderTerm int, leaderCommitIndex int, theLastIdx int) {
+	for id := 0; id < len(rf.peers); id++ {
+		if id != rf.id {
+			go rf.appendEntries(id, leaderTerm, leaderCommitIndex, theLastIdx)
+		}
+	}
+}
+
+func (rf *Raft) appendEntries(to int, leaderTerm int, leaderCommitIndex int, beginIdx int) {
+	if !rf.isLeader() {
+		return
+	}
+
+	Assert(beginIdx > 0)
+	entries := make(map[int]Entry)
+
+	var ok bool
+	for rf.isLeader() {
+		entry := rf.entries[beginIdx]
+		entry.AppendTerm = leaderTerm
+		entries[beginIdx] = entry
+		args := &AppendEntriesArgs{
+			Type:         MsgAppend,
+			LeaderTerm:   leaderTerm,
+			LeaderId:     rf.id,
+			LeaderCommit: leaderCommitIndex,
+			Entries:      entries,
+			PrevLogIdx: beginIdx-1,
+		}
+		reply := &AppendEntriesReply{}
+		if beginIdx > 1 {
+			args.PrevLogTerm = rf.entries[beginIdx-1].Term
+		}
+
+		if !rf.isLeader() {
+			return
+		}
+		ok = rf.sendAppendEntries(to, args, reply)
+		for !ok {
+			time.Sleep(AppendWaitTime)
+			if !rf.isLeader() || rf.killed() {
+				return
+			}
+			ok = rf.sendAppendEntries(to, args, reply)
+		}
+
+		if reply.Term > leaderTerm {
+			return
+		}
+		if reply.Success {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if rf.matchIndex[to] < reply.FollowerEntrySize {
+				rf.matchIndex[to] = reply.FollowerEntrySize
+				rf.nextIndex[to] = reply.FollowerEntrySize + 1
+				rf.updateLeaderCommit()
+			}
+			return
+		}
+		beginIdx--
+		if beginIdx <= rf.matchIndex[to] {
+			return
+		}
+	}
+}
+
+// Assuming rf has acquired lock
+func (rf *Raft) updateLeaderCommit() {
+	if !rf.isLeader() {
+		return
+	}
+	var count int
+	for i := rf.commitIndex + 1; i <= len(rf.entries); i++ {
+		count = 0
+		for j, index := range rf.matchIndex {
+			if j == rf.id {
+				count++
+			} else if index > rf.commitIndex {
+				count++
+			}
+			if count > len(rf.peers)/2 && rf.entries[i].Term == rf.term {
+				rf.commit(i)
+				rf.commitIndex++
+				break
+			}
+		}
+		if count <= len(rf.peers)/2 {
+			break
+		}
+	}
+}
+
+func (rf *Raft) followerTryToCommitUntil(leaderCommitIndex int, leaderTerm int) {
+	newCommitIndex := min(len(rf.entries), leaderCommitIndex)
+	for newCommitIndex > rf.commitIndex {
+		if rf.entries[newCommitIndex].Term == leaderTerm {
+			rf.commitUntil(newCommitIndex)
+			break
+		}
+		newCommitIndex--
+	}
+}
+
+func (rf *Raft) commitUntil(commitIndex int) {
+	commitIndex = min(commitIndex, len(rf.entries))
+	Assert(len(rf.entries) >= commitIndex && rf.commitIndex < commitIndex)
+	for i := rf.commitIndex + 1; i <= commitIndex; i++ {
+		rf.commit(i)
+		rf.commitIndex++
+	}
+}
+
+func (rf *Raft) commit(commitIndex int) {
+	Assert(len(rf.entries) >= commitIndex && rf.commitIndex < commitIndex)
+	rf.applyCh <- ApplyMsg{
+		CommandValid: true,
+		Command:      rf.entries[commitIndex].Cmd,
+		CommandIndex: commitIndex,
+	}
 }
 
 //
@@ -630,6 +812,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.dead = 0
 	rf.applyCh = applyCh
+	rf.entries = make(map[int]Entry)
+	rf.commitIndex = 0
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 
 	rf.state = StateFollower
 	rf.term = 0
@@ -652,21 +838,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 // Caller should ensure that rf already holds mu.
 func (rf *Raft) checkFollower() {
-	assert.Assert(!rf.killed())
-	assert.Assert(rf.isFollower())
+	Assert(!rf.killed())
+	Assert(rf.isFollower())
 }
 
 // Caller should ensure that rf already holds mu.
 func (rf *Raft) checkPreCandidate() {
-	assert.Assert(!rf.killed())
-	assert.Assert(rf.isPreCandidate())
+	Assert(!rf.killed())
+	Assert(rf.isPreCandidate())
 }
 
 // Caller should ensure that rf already holds mu.
 func (rf *Raft) checkCandidate() {
-	assert.Assert(!rf.killed())
-	assert.Assert(rf.isCandidate())
-	assert.Assert(rf.term > 0)
+	Assert(!rf.killed())
+	Assert(rf.isCandidate())
+	Assert(rf.term > 0)
 }
 
 func (rf *Raft) checkPreCandOrCand() {
@@ -682,9 +868,9 @@ func (rf *Raft) checkPreCandOrCand() {
 
 // Caller should ensure that rf already holds mu.
 func (rf *Raft) checkLeader() {
-	assert.Assert(!rf.killed())
-	assert.Assert(rf.isLeader())
-	assert.Assert(rf.term > 0)
+	Assert(!rf.killed())
+	Assert(rf.isLeader())
+	Assert(rf.term > 0)
 }
 
 // Caller should ensure that rf already holds mu.
@@ -736,4 +922,18 @@ func (rf *Raft) isCandidate() bool {
 
 func (rf *Raft) isLeader() bool {
 	return atomic.LoadInt32((*int32)(&rf.state)) == int32(StateLeader)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
