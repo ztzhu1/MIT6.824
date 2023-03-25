@@ -125,9 +125,11 @@ func (rf *Raft) GetState() (int, bool) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term     int
-	From     int
-	CampType CampaignType
+	Term         int
+	From         int
+	CampType     CampaignType
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -149,11 +151,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	reply.Term = rf.term
 	reply.VoteGranted = false
-	if !rf.canVoteFor(args.From, args.Term) {
+	if !rf.canVoteFor(args.From, args.Term, args.LastLogIndex, args.LastLogTerm) {
 		return
 	}
 	if args.CampType == CampaignCandidate {
-		rf.recordVoteFor(args.From, args.Term)
+		rf.recordVoteFor(args.From, args.Term, args.LastLogIndex, args.LastLogTerm)
 		DPrintf("%v(term %v) voted for %v(term %v)", rf.id, rf.term, args.From, args.Term)
 		rf.term = args.Term
 	}
@@ -453,13 +455,12 @@ func (rf *Raft) becomeFollower() {
 	DPrintf("%v(term %v) becomes follower", rf.id, rf.term)
 }
 
-func (rf *Raft) becomePreCandidate() int {
+func (rf *Raft) becomePreCandidate() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.checkFollower()
 	rf.state = StatePreCandidate
 	DPrintf("%v(term %v) becomes pre-candidate", rf.id, rf.term)
-	return rf.term
 }
 
 func (rf *Raft) becomeCandidate() {
@@ -507,35 +508,59 @@ func (rf *Raft) resetVoteFor() {
 }
 
 // caller should have acquired the lock
-func (rf *Raft) recordVoteFor(which int, termOfWhich int) {
-	Assert(rf.canVoteFor(which, termOfWhich))
-	rf.votedFor = which
-	rf.votedTerm = termOfWhich
+func (rf *Raft) recordVoteFor(cand int, termOfCand int, lastLogindexOfCand int, lastLogTermOfCand int) {
+	Assert(rf.canVoteFor(cand, termOfCand, lastLogindexOfCand, lastLogTermOfCand))
+	rf.votedFor = cand
+	rf.votedTerm = termOfCand
 }
 
 // caller should have acquired the lock
-func (rf *Raft) canVoteFor(which int, termOfWhich int) bool {
-	if rf.state == StateLeader || (rf.state != StateFollower && which != rf.id) {
+func (rf *Raft) canVoteFor(cand int, termOfCand int, lastLogindexOfCand int, lastLogTermOfCand int) bool {
+	if rf.state == StateLeader || (rf.state != StateFollower && cand != rf.id) {
 		// only followers can vote, except when voting for self
 		return false
 	}
-	if rf.votedTerm > termOfWhich {
+	if rf.upToDateThan(lastLogindexOfCand, lastLogTermOfCand) {
+		return false
+	}
+	if rf.votedTerm > termOfCand {
 		// `which` is out-of-date
 		return false
 	}
-	if rf.votedTerm < termOfWhich {
+	if rf.votedTerm < termOfCand {
 		// `which` is newer
 		return true
 	}
-	// `rf.votedTerm` == `termOfWhich`, only can vote for self
-	if rf.votedFor == which {
+	// `rf.votedTerm` == `termOfCand`, only can vote for self
+	if rf.votedFor == cand {
 		return true
 	}
 	return false
 }
 
-// func (rf *Raft) upToDateThan(which int, termOfWhich int) bool {
-// }
+// caller should have acquired the lock
+func (rf *Raft) upToDateThan(lastLogindexOfCand int, lastLogTermOfCand int) bool {
+	last := len(rf.entries)
+	if last == 0 {
+		DWarning("%v(term %v) false %v %v", rf.id, rf.term, last, lastLogindexOfCand)
+		return false
+	}
+	if lastLogindexOfCand == 0 {
+		DWarning("%v(term %v) true %v %v", rf.id, rf.term, last, lastLogindexOfCand)
+		return true
+	}
+	if rf.entries[last].Term > lastLogTermOfCand {
+		DWarning("%v(term %v) true %v %v", rf.id, rf.term, last, lastLogindexOfCand)
+		return true
+	}
+	if rf.entries[last].Term < lastLogTermOfCand {
+		DWarning("%v(term %v) false %v %v", rf.id, rf.term, last, lastLogindexOfCand)
+		return false
+	}
+	// rf.entries[last].Term == lastLogTermOfCand
+	DWarning("%v(term %v) %v %v %v", rf.id, rf.term, last > lastLogindexOfCand, last, lastLogindexOfCand)
+	return last > lastLogindexOfCand
+}
 
 // -------- actions --------
 
@@ -544,8 +569,15 @@ func (rf *Raft) campaign(t CampaignType) {
 
 	switch {
 	case t == CampaignPreCandidate:
-		candTerm := rf.becomePreCandidate() + 1
-		rf.bcastRequestVote(replyCh, candTerm, CampaignPreCandidate)
+		rf.becomePreCandidate()
+
+		rf.mu.Lock()
+		candTerm := rf.term + 1
+		lastLogindexOfCand := len(rf.entries)
+		lastLogTermOfCand := rf.entries[lastLogindexOfCand].Term
+		rf.mu.Unlock()
+
+		rf.bcastRequestVote(replyCh, candTerm, CampaignPreCandidate, lastLogindexOfCand, lastLogTermOfCand)
 		success, _ := rf.campaignSuccess(replyCh)
 		if rf.isFollower() {
 			// State transition may happen at any
@@ -569,9 +601,11 @@ func (rf *Raft) campaign(t CampaignType) {
 			return
 		}
 		candTerm := rf.term
+		lastLogindexOfCand := len(rf.entries)
+		lastLogTermOfCand := rf.entries[lastLogindexOfCand].Term
 		rf.mu.Unlock()
 
-		rf.bcastRequestVote(replyCh, candTerm, CampaignCandidate)
+		rf.bcastRequestVote(replyCh, candTerm, CampaignCandidate, lastLogindexOfCand, lastLogTermOfCand)
 		success, timeout := rf.campaignSuccess(replyCh)
 		if rf.isFollower() {
 			// State transition may happen at any
@@ -612,13 +646,13 @@ func (rf *Raft) campaignSuccess(replyCh chan RequestVoteReply) (success bool, ti
 	return grantedNum > half, false
 }
 
-func (rf *Raft) bcastRequestVote(replyCh chan RequestVoteReply, candTerm int, campType CampaignType) {
+func (rf *Raft) bcastRequestVote(replyCh chan RequestVoteReply, candTerm int, campType CampaignType, lastLogindexOfCand int, lastLogTermOfCand int) {
 	for id := 0; id < len(rf.peers); id++ {
-		go rf.requestVote(id, replyCh, candTerm, campType)
+		go rf.requestVote(id, replyCh, candTerm, campType, lastLogindexOfCand, lastLogTermOfCand)
 	}
 }
 
-func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply, candTerm int, campType CampaignType) {
+func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply, candTerm int, campType CampaignType, lastLogindexOfCand int, lastLogTermOfCand int) {
 	rf.mu.Lock()
 	if rf.isFollower() {
 		rf.mu.Unlock()
@@ -627,7 +661,7 @@ func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply, candTerm int,
 	// it can vote for self directly
 	if rf.id == to {
 		if campType == CampaignCandidate {
-			rf.recordVoteFor(rf.id, candTerm)
+			rf.recordVoteFor(rf.id, candTerm, lastLogindexOfCand, lastLogTermOfCand)
 		}
 		replyCh <- RequestVoteReply{candTerm, true}
 		rf.mu.Unlock()
@@ -636,9 +670,11 @@ func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply, candTerm int,
 	rf.mu.Unlock()
 
 	args := &RequestVoteArgs{
-		Term:     candTerm,
-		From:     rf.id,
-		CampType: campType,
+		Term:         candTerm,
+		From:         rf.id,
+		CampType:     campType,
+		LastLogIndex: lastLogindexOfCand,
+		LastLogTerm:  lastLogTermOfCand,
 	}
 	reply := &RequestVoteReply{}
 	ok := rf.sendRequestVote(to, args, reply)
@@ -666,7 +702,10 @@ func (rf *Raft) sendHeartBeat(to int, leaderTerm int, leaderCommit int) {
 		LeaderCommit: leaderCommit,
 	}
 	reply := &AppendEntriesReply{}
-	rf.sendAppendEntries(to, args, reply)
+	ok := rf.sendAppendEntries(to, args, reply)
+	if ok && reply.Term > leaderTerm && rf.isLeader() {
+		rf.becomeFollower()
+	}
 }
 
 func (rf *Raft) bcastAppendEntries(leaderTerm int, leaderCommitIndex int, theLastIdx int) {
@@ -696,7 +735,7 @@ func (rf *Raft) appendEntries(to int, leaderTerm int, leaderCommitIndex int, beg
 			LeaderId:     rf.id,
 			LeaderCommit: leaderCommitIndex,
 			Entries:      entries,
-			PrevLogIdx: beginIdx-1,
+			PrevLogIdx:   beginIdx - 1,
 		}
 		reply := &AppendEntriesReply{}
 		if beginIdx > 1 {
