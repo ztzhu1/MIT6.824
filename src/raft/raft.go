@@ -40,7 +40,7 @@ type lockedRand struct {
 
 func (r *lockedRand) randTimeout(baseTimeout int64) int64 {
 	r.mu.Lock()
-	v := r.rand.Int63n(2 * baseTimeout)
+	v := r.rand.Int63n(baseTimeout)
 	r.mu.Unlock()
 	return baseTimeout + v
 }
@@ -120,8 +120,9 @@ func (rf *Raft) GetState() (int, bool) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term int
-	From int
+	Term     int
+	From     int
+	CampType CampaignType
 }
 
 //
@@ -146,8 +147,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if !rf.canVoteFor(args.From, args.Term) || args.Term < rf.term {
 		return
 	}
-	rf.recordVoteFor(args.From, args.Term)
-	DPrintf("%v(term %v) voted for %v(term %v)", rf.id, rf.term, args.From, args.Term)
+	if args.CampType == CampaignCandidate {
+		rf.recordVoteFor(args.From, args.Term)
+		DPrintf("%v(term %v) voted for %v(term %v)", rf.id, rf.term, args.From, args.Term)
+		rf.term = args.Term
+	}
 	reply.VoteGranted = true
 }
 
@@ -211,11 +215,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		assert.Assert(rf.term < args.LeaderTerm || rf.state != StateLeader)
 		reply.Success = true
 		rf.resetElectionElapsed()
-		if rf.term < args.LeaderTerm {
-			rf.setState(StateFollower)
-			rf.tick = rf.tickFollower
-			rf.term = args.LeaderTerm
-		}
+		rf.setState(StateFollower)
+		rf.tick = rf.tickFollower
+		rf.term = args.LeaderTerm
 	default:
 		panic("unreachable")
 	}
@@ -343,6 +345,7 @@ func (rf *Raft) ticker() {
 	for {
 		<-ticker_.C
 		if rf.killed() {
+			DWarning("%v(term %v) killed", rf.id, rf.term)
 			return
 		}
 		rf.tick()
@@ -364,10 +367,6 @@ func (rf *Raft) tickFollower() {
 		return
 	}
 	rf.resetElectionElapsed()
-
-	if rf.votedTerm > rf.term {
-		return
-	}
 
 	rf.campaign(CampaignPreCandidate)
 }
@@ -465,8 +464,6 @@ func (rf *Raft) canVoteFor(which int, termOfWhich int) bool {
 	}
 	if rf.votedTerm < termOfWhich {
 		// `which` is newer
-		rf.votedFor = which
-		rf.votedTerm = termOfWhich
 		return true
 	}
 	if rf.votedTerm > termOfWhich {
@@ -488,7 +485,7 @@ func (rf *Raft) campaign(t CampaignType) {
 	switch {
 	case t == CampaignPreCandidate:
 		candTerm := rf.becomePreCandidate() + 1
-		rf.bcastRequestVote(replyCh, candTerm)
+		rf.bcastRequestVote(replyCh, candTerm, CampaignPreCandidate)
 		success, _ := rf.campaignSuccess(replyCh)
 		if rf.isFollower() {
 			// State transition may happen at any
@@ -507,17 +504,19 @@ func (rf *Raft) campaign(t CampaignType) {
 		assert.Assert(!rf.isPreCandidate())
 		assert.Assert(!rf.isLeader())
 		if rf.isFollower() {
+			DWarning("%v(term %v) steps down to follower, stop campaigning", rf.id, rf.term)
 			rf.mu.Unlock()
 			return
 		}
 		candTerm := rf.term
 		rf.mu.Unlock()
 
-		rf.bcastRequestVote(replyCh, candTerm)
+		rf.bcastRequestVote(replyCh, candTerm, CampaignCandidate)
 		success, timeout := rf.campaignSuccess(replyCh)
 		if rf.isFollower() {
 			// State transition may happen at any
 			// unprotected time due to `AppendEntries`.
+			DWarning("%v(term %v) steps down to follower, stop campaigning", rf.id, rf.term)
 			return
 		}
 		if success {
@@ -525,6 +524,8 @@ func (rf *Raft) campaign(t CampaignType) {
 			// TODO (ztzhu): do something else
 		} else if timeout {
 			// re-elect
+			DWarning("%v(term %v) timeout, re-campaign", rf.id, rf.term)
+			rf.term++
 			rf.campaign(CampaignCandidate)
 		}
 	}
@@ -551,26 +552,29 @@ func (rf *Raft) campaignSuccess(replyCh chan RequestVoteReply) (success bool, ti
 	return grantedNum > half, false
 }
 
-func (rf *Raft) bcastRequestVote(replyCh chan RequestVoteReply, candTerm int) {
+func (rf *Raft) bcastRequestVote(replyCh chan RequestVoteReply, candTerm int, campType CampaignType) {
 	for id := 0; id < len(rf.peers); id++ {
-		go rf.requestVote(id, replyCh, candTerm)
+		go rf.requestVote(id, replyCh, candTerm, campType)
 	}
 }
 
-func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply, candTerm int) {
+func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply, candTerm int, campType CampaignType) {
 	if rf.isFollower() {
 		return
 	}
 	// it can vote for self directly
 	if rf.id == to {
-		rf.recordVoteFor(rf.id, candTerm)
+		if campType == CampaignCandidate {
+			rf.recordVoteFor(rf.id, candTerm)
+		}
 		replyCh <- RequestVoteReply{candTerm, true}
 		return
 	}
 
 	args := &RequestVoteArgs{
-		Term: candTerm,
-		From: rf.id,
+		Term:     candTerm,
+		From:     rf.id,
+		CampType: campType,
 	}
 	reply := &RequestVoteReply{}
 	ok := rf.sendRequestVote(to, args, reply)
