@@ -144,7 +144,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	reply.Term = rf.term
 	reply.VoteGranted = false
-	if !rf.canVoteFor(args.From, args.Term) || args.Term < rf.term {
+	if !rf.canVoteFor(args.From, args.Term) {
 		return
 	}
 	if args.CampType == CampaignCandidate {
@@ -462,13 +462,13 @@ func (rf *Raft) canVoteFor(which int, termOfWhich int) bool {
 		// only followers can vote, except when voting for self
 		return false
 	}
-	if rf.votedTerm < termOfWhich {
-		// `which` is newer
-		return true
-	}
 	if rf.votedTerm > termOfWhich {
 		// `which` is out-of-date
 		return false
+	}
+	if rf.votedTerm < termOfWhich {
+		// `which` is newer
+		return true
 	}
 	// `rf.votedTerm` == `termOfWhich`, only can vote for self
 	if rf.votedFor == which {
@@ -559,7 +559,9 @@ func (rf *Raft) bcastRequestVote(replyCh chan RequestVoteReply, candTerm int, ca
 }
 
 func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply, candTerm int, campType CampaignType) {
+	rf.mu.Lock()
 	if rf.isFollower() {
+		rf.mu.Unlock()
 		return
 	}
 	// it can vote for self directly
@@ -568,8 +570,10 @@ func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply, candTerm int,
 			rf.recordVoteFor(rf.id, candTerm)
 		}
 		replyCh <- RequestVoteReply{candTerm, true}
+		rf.mu.Unlock()
 		return
 	}
+	rf.mu.Unlock()
 
 	args := &RequestVoteArgs{
 		Term:     candTerm,
