@@ -17,6 +17,7 @@ const (
 	MsgVote MsgType = iota
 	MsgHeartBeat
 	MsgAppend
+	MsgCommit
 )
 
 // ------ CampaignType ------
@@ -26,3 +27,17 @@ const (
 	CampaignPreCandidate CampaignType = iota
 	CampaignCandidate
 )
+
+// ------ Entry ------
+type Entry struct {
+	Cmd interface{}
+	// leader term in `Start`
+	Term int
+	// leader term in `AppendEntries`
+	// Add this field so that if an
+	// entry has been replicated by
+	// the leader, later re-replicate
+	// request caused by latency will
+	// be ignored
+	AppendTerm int
+}
