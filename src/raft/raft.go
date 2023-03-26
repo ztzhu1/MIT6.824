@@ -542,23 +542,18 @@ func (rf *Raft) canVoteFor(cand int, termOfCand int, lastLogindexOfCand int, las
 func (rf *Raft) upToDateThan(lastLogindexOfCand int, lastLogTermOfCand int) bool {
 	last := len(rf.entries)
 	if last == 0 {
-		DWarning("%v(term %v) false %v %v", rf.id, rf.term, last, lastLogindexOfCand)
 		return false
 	}
 	if lastLogindexOfCand == 0 {
-		DWarning("%v(term %v) true %v %v", rf.id, rf.term, last, lastLogindexOfCand)
 		return true
 	}
 	if rf.entries[last].Term > lastLogTermOfCand {
-		DWarning("%v(term %v) true %v %v", rf.id, rf.term, last, lastLogindexOfCand)
 		return true
 	}
 	if rf.entries[last].Term < lastLogTermOfCand {
-		DWarning("%v(term %v) false %v %v", rf.id, rf.term, last, lastLogindexOfCand)
 		return false
 	}
 	// rf.entries[last].Term == lastLogTermOfCand
-	DWarning("%v(term %v) %v %v %v", rf.id, rf.term, last > lastLogindexOfCand, last, lastLogindexOfCand)
 	return last > lastLogindexOfCand
 }
 
@@ -726,7 +721,9 @@ func (rf *Raft) appendEntries(to int, leaderTerm int, leaderCommitIndex int, beg
 
 	var ok bool
 	for rf.isLeader() {
+		rf.mu.Lock()
 		entry := rf.entries[beginIdx]
+		rf.mu.Unlock()
 		entry.AppendTerm = leaderTerm
 		entries[beginIdx] = entry
 		args := &AppendEntriesArgs{
@@ -739,7 +736,9 @@ func (rf *Raft) appendEntries(to int, leaderTerm int, leaderCommitIndex int, beg
 		}
 		reply := &AppendEntriesReply{}
 		if beginIdx > 1 {
+			rf.mu.Lock()
 			args.PrevLogTerm = rf.entries[beginIdx-1].Term
+			rf.mu.Unlock()
 		}
 
 		if !rf.isLeader() {
@@ -768,9 +767,12 @@ func (rf *Raft) appendEntries(to int, leaderTerm int, leaderCommitIndex int, beg
 			return
 		}
 		beginIdx--
+		rf.mu.Lock()
 		if beginIdx <= rf.matchIndex[to] {
+			rf.mu.Unlock()
 			return
 		}
+		rf.mu.Unlock()
 	}
 }
 
