@@ -5,11 +5,8 @@ import "log"
 // Debugging
 var Debug bool = false
 
-func InitLog(enable bool) {
-	if enable {
-		Debug = true
-		log.SetFlags(log.Ltime | log.Lmicroseconds)
-	}
+func init() {
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
 }
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
