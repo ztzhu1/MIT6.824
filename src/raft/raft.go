@@ -106,6 +106,9 @@ type Raft struct {
 	tick func()
 }
 
+var appendMu []sync.Mutex // Only one goroutine can append entries at the same time
+var appendMuMu sync.Mutex
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -148,7 +151,9 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
+	appendMu[rf.id].Lock()
 	defer rf.mu.Unlock()
+	defer appendMu[rf.id].Unlock()
 	reply.Term = rf.term
 	reply.VoteGranted = false
 	if !rf.canVoteFor(args.From, args.Term, args.LastLogIndex, args.LastLogTerm) {
@@ -209,9 +214,11 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term              int
-	Success           bool
-	FollowerEntrySize int
+	Term                         int
+	Success                      bool
+	FollowerEntrySize            int
+	FirstConflictOfThisTerm      int
+	FirstConflictOfThisTermValid bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -220,6 +227,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.term
 	reply.Success = false
 	reply.FollowerEntrySize = len(rf.entries)
+	reply.FirstConflictOfThisTermValid = false
 	if args.LeaderTerm < rf.term {
 		// old leader
 		return
@@ -260,6 +268,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			reply.FollowerEntrySize = len(rf.entries)
 			reply.Success = true
+		} else if size >= prev && rf.entries[prev].Term != args.PrevLogTerm {
+			// invariant: prev > 0, size > 0
+			term := rf.entries[prev].Term
+			i := prev
+			for ; i > 0; i-- {
+				if rf.entries[i].Term != term {
+					break
+				}
+			}
+			reply.FirstConflictOfThisTerm = i + 1
+			reply.FirstConflictOfThisTermValid = true
 		}
 	default:
 		panic("unreachable")
@@ -358,7 +377,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.entries[index] = Entry{command, rf.term, rf.term}
-	rf.bcastAppendEntries(term, rf.commitIndex, index)
+	rf.bcastAppendEntries(term, rf.commitIndex)
 
 	return index, term, true
 }
@@ -703,29 +722,35 @@ func (rf *Raft) sendHeartBeat(to int, leaderTerm int, leaderCommit int) {
 	}
 }
 
-func (rf *Raft) bcastAppendEntries(leaderTerm int, leaderCommitIndex int, theLastIdx int) {
+func (rf *Raft) bcastAppendEntries(leaderTerm int, leaderCommitIndex int) {
 	for id := 0; id < len(rf.peers); id++ {
 		if id != rf.id {
-			go rf.appendEntries(id, leaderTerm, leaderCommitIndex, theLastIdx)
+			go rf.appendEntries(id, leaderTerm, leaderCommitIndex)
 		}
 	}
 }
 
-func (rf *Raft) appendEntries(to int, leaderTerm int, leaderCommitIndex int, beginIdx int) {
+func (rf *Raft) appendEntries(to int, leaderTerm int, leaderCommitIndex int) {
 	if !rf.isLeader() {
 		return
 	}
 
-	Assert(beginIdx > 0)
 	entries := make(map[int]Entry)
 
+	appendMu[to].Lock()
+	beginIdx := rf.nextIndex[to]
+	leastIdx := len(rf.entries) + 1
+	appendMu[to].Unlock()
 	var ok bool
 	for rf.isLeader() {
 		rf.mu.Lock()
-		entry := rf.entries[beginIdx]
+		for i := leastIdx - 1; i >= beginIdx; i-- {
+			entry := rf.entries[i]
+			entry.AppendTerm = leaderTerm
+			entries[i] = entry
+		}
+		leastIdx = beginIdx
 		rf.mu.Unlock()
-		entry.AppendTerm = leaderTerm
-		entries[beginIdx] = entry
 		args := &AppendEntriesArgs{
 			Type:         MsgAppend,
 			LeaderTerm:   leaderTerm,
@@ -758,7 +783,9 @@ func (rf *Raft) appendEntries(to int, leaderTerm int, leaderCommitIndex int, beg
 		}
 		if reply.Success {
 			rf.mu.Lock()
+			appendMu[to].Lock()
 			defer rf.mu.Unlock()
+			defer appendMu[to].Unlock()
 			if rf.matchIndex[to] < reply.FollowerEntrySize {
 				rf.matchIndex[to] = reply.FollowerEntrySize
 				rf.nextIndex[to] = reply.FollowerEntrySize + 1
@@ -766,12 +793,17 @@ func (rf *Raft) appendEntries(to int, leaderTerm int, leaderCommitIndex int, beg
 			}
 			return
 		}
-		beginIdx--
+		if reply.FirstConflictOfThisTermValid {
+			beginIdx = reply.FirstConflictOfThisTerm
+		} else {
+			beginIdx--
+		}
 		rf.mu.Lock()
 		if beginIdx <= rf.matchIndex[to] {
 			rf.mu.Unlock()
 			return
 		}
+		rf.nextIndex[to] = beginIdx
 		rf.mu.Unlock()
 	}
 }
@@ -857,6 +889,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	appendMuMu.Lock()
+	if appendMu == nil || len(appendMu) < len(peers) {
+		appendMu = make([]sync.Mutex, len(peers))
+	}
+	appendMuMu.Unlock()
 
 	rf.state = StateFollower
 	rf.term = 0
