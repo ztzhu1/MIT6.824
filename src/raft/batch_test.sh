@@ -11,10 +11,14 @@ function ctrl_c() {
     fail=true
 }
 
-for (( i=0; i < $2 && !fail; ++i ))
+for (( i=0; i < $2; ++i ))
 do
     echo -e "\x1b[1;34m${i}th test begins\x1b[0m"
     bash ./test.sh $1 | grep -ie "fail[^u]" && fail=true
+    if [[ $fail = "true" ]]
+    then
+        break
+    fi
 done
 
 if [[ $fail = "false" ]]
