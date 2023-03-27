@@ -86,17 +86,20 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	applyCh chan ApplyMsg
+	commitCh chan ApplyMsg
+	applyCh  chan ApplyMsg
 
 	state     RaftState
 	term      int
 	votedFor  int
 	votedTerm int
 
-	entries     map[int]Entry
-	commitIndex int
-	nextIndex   []int
-	matchIndex  []int
+	entries          map[int]Entry
+	commitIndex      int
+	discardCount     int
+	lastdiscarDEntry Entry
+	nextIndex        []int
+	matchIndex       []int
 
 	electionTimeout  int64
 	heartBeatTimeout int64
@@ -108,13 +111,12 @@ type Raft struct {
 }
 
 type RaftPersistent struct {
-	// State     RaftState
-	Term      int
-	VotedFor  int
-	VotedTerm int
-
-	Entries map[int]Entry
-	// CommitIndex int
+	Term             int
+	VotedFor         int
+	VotedTerm        int
+	DiscardCount     int
+	LastdiscarDEntry Entry
+	Entries          map[int]Entry
 }
 
 // return currentTerm and whether this server
@@ -233,8 +235,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	reply.Term = rf.term
 	reply.Success = false
-	reply.FollowerEntrySize = len(rf.entries)
-	reply.FollowerEntrySize = len(rf.entries)
+	reply.FollowerEntrySize = rf.logSize()
 	reply.FirstConflictOfThisTermValid = false
 	if args.LeaderTerm < rf.term {
 		// old leader
@@ -252,47 +253,57 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 		rf.followerTryToCommitUntil(args.LeaderCommit, args.LeaderTerm)
 	case args.Type == MsgAppend:
-		size := len(rf.entries)
+		size := rf.logSize()
 		prev := args.PrevLogIdx
-		if prev == 0 || (size >= prev && rf.entries[prev].Term == args.PrevLogTerm) {
-			// append entries to follower
-			i := prev + 1
-			for ; i <= prev+len(args.Entries); i++ {
-				entry, exist := rf.entries[i]
-				if exist && entry.AppendTerm >= args.LeaderTerm {
-					// The entry is appended by a up-to-date leader, may be
-					// the caller itself, so we can ignore it.
-					continue
+		if prev >= rf.discardCount {
+			if prev == 0 || (size >= prev && rf.entry(prev).Term == args.PrevLogTerm) {
+				// append entries to follower
+				i := prev + 1
+				for ; i <= prev+len(args.Entries); i++ {
+					if rf.commitIndex >= i {
+						continue
+					}
+					entry, exist := rf.entries[i]
+					if exist && entry.AppendTerm >= args.LeaderTerm {
+						// The entry is appended by a up-to-date leader, may be
+						// the caller itself, so we can ignore it.
+						continue
+					}
+					rf.entries[i] = args.Entries[i]
+					rf.persist()
 				}
-				rf.entries[i] = args.Entries[i]
-				rf.persist()
-			}
-			for ; i <= size; i++ {
-				entry, exist := rf.entries[i]
-				if exist && entry.AppendTerm >= args.LeaderTerm {
-					// the latter entries must be at least as
-					// up-to-date as leader's entries
-					break
+				for ; i <= size; i++ {
+					if rf.commitIndex >= i {
+						continue
+					}
+					entry, exist := rf.entries[i]
+					if exist && entry.AppendTerm >= args.LeaderTerm {
+						// the latter entries must be at least as
+						// up-to-date as leader's entries
+						break
+					}
+					delete(rf.entries, i)
+					rf.persist()
 				}
-				delete(rf.entries, i)
-				rf.persist()
-			}
-			rf.followerTryToCommitUntil(args.LeaderCommit, args.LeaderTerm)
-			reply.FollowerEntrySize = len(rf.entries)
-			reply.Success = true
-		} else if size >= prev && rf.entries[prev].Term != args.PrevLogTerm {
-			// invariant: prev > 0, size > 0
-			term := rf.entries[prev].Term
-			i := prev
-			for ; i > 0; i-- {
-				if rf.entries[i].Term != term {
-					break
+				rf.followerTryToCommitUntil(args.LeaderCommit, args.LeaderTerm)
+				reply.FollowerEntrySize = rf.logSize()
+				reply.Success = true
+			} else if size >= prev && rf.entry(prev).Term != args.PrevLogTerm {
+				// invariant: prev > 0, size > 0
+				term := rf.entry(prev).Term
+				i := prev
+				for ; i > 0; i-- {
+					if rf.entry(i).Term != term {
+						break
+					}
 				}
+				reply.FirstConflictOfThisTerm = i + 1
+				reply.FirstConflictOfThisTermValid = true
+			} else {
+				// DInfo("%v(term %v, leader %v), size: %v, prev: %v, prev term:%v, leader prev term: %v", rf.id, rf.term, args.LeaderId, size, prev, rf.entries[prev].Term, args.PrevLogTerm)
 			}
-			reply.FirstConflictOfThisTerm = i + 1
-			reply.FirstConflictOfThisTermValid = true
 		} else {
-			// DWarning("%v(term %v, leader %v), size: %v, prev: %v, prev term:%v, leader prev term: %v", rf.id, rf.term, args.LeaderId, size, prev, rf.entries[prev].Term, args.PrevLogTerm)
+			// reply.NeedSnapshot = true
 		}
 	default:
 		panic("unreachable")
@@ -302,6 +313,72 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+type InstallSnapShotArgs struct {
+	LeaderTerm int
+	LeaderId   int
+	Snapshot   []byte
+}
+
+type InstallSnapShotReply struct {
+	Term       int
+	MatchIndex int
+}
+
+func (rf *Raft) InstallSnap(args *InstallSnapShotArgs, reply *InstallSnapShotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.term
+	reply.MatchIndex = rf.commitIndex
+	if args.LeaderTerm < rf.term {
+		// old leader
+		return
+	}
+	// DInfo("%v(term %v) discnt: %v, len: %v, logsize: %v, commit index: %v", rf.id, rf.term, rf.discardCount, len(rf.entries), rf.logSize(), rf.commitIndex)
+	commandIndex, cmds := rf.decode(args.Snapshot)
+
+	ssLastIndex := commandIndex
+	// ssLastTerm:=args.Entries[ssLastIndex].Term
+	if rf.commitIndex >= ssLastIndex {
+		// we don't need this snapshot
+		return
+	}
+	Assert(rf.minEntryIndex() < ssLastIndex)
+	if rf.maxEntryIndex() <= ssLastIndex {
+		// this snapshot includes all the information we should know
+		for i := rf.commitIndex + 1; i <= ssLastIndex; i++ {
+			rf.entries[i] = Entry{cmds[i-1].(int), 0, 0}
+			rf.commit(i)
+		}
+		Assert(rf.commitIndex == ssLastIndex)
+		rf.lastdiscarDEntry = rf.entry(ssLastIndex)
+		rf.entries = make(map[int]Entry)
+		rf.discardCount = ssLastIndex
+		Assert(ssLastIndex != 0)
+		Assert(len(args.Snapshot) > 0)
+		rf.persistStateAndSnapshot(args.Snapshot)
+		reply.MatchIndex = ssLastIndex
+		return
+	}
+	for i := rf.commitIndex + 1; i <= ssLastIndex; i++ {
+		rf.entries[i] = Entry{cmds[i-1].(int), 0, 0}
+		rf.commit(i)
+	}
+
+	rf.lastdiscarDEntry = rf.entry(ssLastIndex)
+	for i := rf.minEntryIndex(); i <= ssLastIndex; i++ {
+		delete(rf.entries, i)
+		rf.discardCount++
+		Assert(len(args.Snapshot) > 0)
+		rf.persistStateAndSnapshot(args.Snapshot)
+	}
+	reply.MatchIndex = ssLastIndex
+}
+
+func (rf *Raft) sendInstallSnap(server int, args *InstallSnapShotArgs, reply *InstallSnapShotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnap", args, reply)
 	return ok
 }
 
@@ -325,17 +402,36 @@ func (rf *Raft) persist() {
 	rp.Term = rf.term
 	rp.VotedFor = rf.votedFor
 	rp.VotedTerm = rf.votedTerm
+	rp.DiscardCount = rf.discardCount
+	rp.LastdiscarDEntry = rf.lastdiscarDEntry
 	rp.Entries = rf.entries
 	encoder.Encode(rp)
 	data := buf.Bytes()
 	rf.persister.SaveRaftState(data)
-	// DWarning("%v(term %v, commit %v) %v",rf.id,rf.term ,rf.commitIndex,rp)
+	// DInfo("%v(term %v, commit %v) %v",rf.id,rf.term ,rf.commitIndex,rp)
+}
+
+func (rf *Raft) persistStateAndSnapshot(snapshot []byte) {
+	Assert(len(snapshot) > 0)
+	stateBuf := new(bytes.Buffer)
+	stateEncoder := labgob.NewEncoder(stateBuf)
+	var rp RaftPersistent
+	rp.Term = rf.term
+	rp.VotedFor = rf.votedFor
+	rp.VotedTerm = rf.votedTerm
+	rp.DiscardCount = rf.discardCount
+	rp.LastdiscarDEntry = rf.lastdiscarDEntry
+	rp.Entries = rf.entries
+	stateEncoder.Encode(rp)
+	data := stateBuf.Bytes()
+
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 }
 
 //
 // restore previously persisted state.
 //
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -361,8 +457,18 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.term = rp.Term
 	rf.votedFor = rp.VotedFor
 	rf.votedTerm = rp.VotedTerm
+	rf.discardCount = rp.DiscardCount
+	rf.lastdiscarDEntry = rp.LastdiscarDEntry
 	rf.entries = rp.Entries
-	DWarning("%v(term %v) recovered", rf.id, rf.term)
+
+	if len(snapshot) == 0 {
+		return
+	}
+	commandIndex, _ := rf.decode(snapshot)
+	Assert(rf.discardCount == commandIndex)
+	rf.commitIndex=commandIndex
+
+	DInfo("%v recovered", rf)
 }
 
 //
@@ -382,7 +488,25 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	Assert(index > 0)
+	Assert(index <= rf.commitIndex)
+	if index <= rf.discardCount {
+		return
+	}
+	for i := rf.minEntryIndex(); i <= index; i++ {
+		if i > rf.commitIndex {
+			rf.commit(i)
+		}
+		delete(rf.entries, i)
+		rf.discardCount++
+	}
+	Assert(index <= rf.commitIndex)
+	Assert(rf.discardCount <= rf.commitIndex)
+	Assert(len(snapshot) > 0)
+	rf.persistStateAndSnapshot(snapshot)
+	DInfo("%v(term %v) created a snapshot, %v", rf.id, rf.term, rf)
 }
 
 //
@@ -404,7 +528,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	index := len(rf.entries) + 1
+	index := rf.logSize() + 1
 	Assert(rf.commitIndex < index)
 	term := rf.term
 
@@ -433,6 +557,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	close(rf.commitCh)
+	DInfo("kill %v", rf)
 }
 
 func (rf *Raft) killed() bool {
@@ -452,7 +578,7 @@ func (rf *Raft) ticker() {
 	defer ticker_.Stop()
 	for range ticker_.C {
 		if rf.killed() {
-			DWarning("%v(term %v) killed", rf.id, rf.term)
+			DSysInfo("%v(term %v) killed", rf.id, rf.term)
 			return
 		}
 		rf.tick()
@@ -467,7 +593,7 @@ func (rf *Raft) tickFollower() {
 		return
 	}
 	// If the node is follower, there is no another goroutine
-	// to prompt it to pre-candidate, so we can assum it's
+	// to prompt it to pre-candidate, so we can assume it's
 	// always a follower until `rf.campaign`.
 
 	if rf.incElectionElapsed(1) < rf.electionTimeout {
@@ -545,7 +671,7 @@ func (rf *Raft) becomeLeader() {
 		if i == rf.id {
 			continue
 		}
-		rf.nextIndex[i] = len(rf.entries) + 1
+		rf.nextIndex[i] = rf.logSize() + 1
 		rf.matchIndex[i] = 0
 	}
 	rf.bcastHeartBeat(rf.term, rf.commitIndex)
@@ -601,7 +727,7 @@ func (rf *Raft) canVoteFor(cand int, termOfCand int, lastLogindexOfCand int, las
 
 // caller should have acquired the lock
 func (rf *Raft) upToDateThan(lastLogindexOfCand int, lastLogTermOfCand int) bool {
-	last := len(rf.entries)
+	last := rf.logSize()
 	if last == 0 {
 		return false
 	}
@@ -629,8 +755,11 @@ func (rf *Raft) campaign(t CampaignType) {
 
 		rf.mu.Lock()
 		candTerm := rf.term + 1
-		lastLogindexOfCand := len(rf.entries)
-		lastLogTermOfCand := rf.entries[lastLogindexOfCand].Term
+		lastLogindexOfCand := rf.logSize()
+		lastLogTermOfCand := 0
+		if lastLogindexOfCand > 0 {
+			lastLogTermOfCand = rf.entries[lastLogindexOfCand].Term
+		}
 		rf.mu.Unlock()
 
 		rf.bcastRequestVote(replyCh, candTerm, CampaignPreCandidate, lastLogindexOfCand, lastLogTermOfCand)
@@ -652,12 +781,12 @@ func (rf *Raft) campaign(t CampaignType) {
 		Assert(!rf.isPreCandidate())
 		Assert(!rf.isLeader())
 		if rf.isFollower() {
-			DWarning("%v(term %v) steps down to follower, stop campaigning", rf.id, rf.term)
+			DInfo("%v(term %v) steps down to follower, stop campaigning", rf.id, rf.term)
 			rf.mu.Unlock()
 			return
 		}
 		candTerm := rf.term
-		lastLogindexOfCand := len(rf.entries)
+		lastLogindexOfCand := rf.logSize()
 		lastLogTermOfCand := rf.entries[lastLogindexOfCand].Term
 		rf.mu.Unlock()
 
@@ -666,14 +795,14 @@ func (rf *Raft) campaign(t CampaignType) {
 		if rf.isFollower() {
 			// State transition may happen at any
 			// unprotected time due to `AppendEntries`.
-			DWarning("%v(term %v) steps down to follower, stop campaigning", rf.id, rf.term)
+			DInfo("%v(term %v) steps down to follower, stop campaigning", rf.id, rf.term)
 			return
 		}
 		if success {
 			rf.becomeLeader()
 		} else if timeout {
 			// re-elect
-			DWarning("%v(term %v) timeout, re-campaign", rf.id, rf.term)
+			DInfo("%v(term %v) timeout, re-campaign", rf.id, rf.term)
 			rf.term++
 			rf.persist()
 			rf.campaign(CampaignCandidate)
@@ -782,11 +911,43 @@ func (rf *Raft) appendEntries(to int, leaderTerm int, leaderCommitIndex int) {
 	rf.mu.Lock()
 	beginIdx := rf.nextIndex[to]
 	Assert(beginIdx > 0)
-	leastIdx := len(rf.entries) + 1
+	leastIdx := rf.logSize() + 1
 	rf.mu.Unlock()
 	var ok bool
+	// DInfo("%v(term %v) appends to %v (begin: %v)", rf.id, rf.term, to, beginIdx)
 	for rf.isLeader() {
 		rf.mu.Lock()
+
+		if beginIdx <= rf.discardCount {
+			installArgs := &InstallSnapShotArgs{
+				LeaderTerm: leaderTerm,
+				LeaderId:   rf.id,
+				Snapshot:   rf.persister.ReadSnapshot(),
+			}
+			installReply := &InstallSnapShotReply{}
+			rf.mu.Unlock()
+			if !rf.isLeader() {
+				return
+			}
+			// _, e := rf.decode(installArgs.Snapshot)
+			// DInfo("%v(term %v) send snapshot(len %v) to %v, begin:%v, dis:%v", rf.id, rf.term, len(e), to, beginIdx, rf.discardCount)
+
+			ok := rf.sendInstallSnap(to, installArgs, installReply)
+			for !ok {
+				time.Sleep(AppendWaitTime)
+				if !rf.isLeader() || rf.killed() {
+					return
+				}
+				ok = rf.sendInstallSnap(to, installArgs, installReply)
+			}
+			if installReply.MatchIndex > rf.matchIndex[to] {
+				rf.matchIndex[to] = installReply.MatchIndex
+				rf.nextIndex[to] = rf.matchIndex[to] + 1
+			}
+			rf.appendEntries(to, leaderTerm, leaderCommitIndex)
+			return
+		}
+
 		for i := leastIdx - 1; i >= beginIdx; i-- {
 			entry := rf.entries[i]
 			entry.AppendTerm = leaderTerm
@@ -803,7 +964,7 @@ func (rf *Raft) appendEntries(to int, leaderTerm int, leaderCommitIndex int) {
 		}
 		reply := &AppendEntriesReply{}
 		if beginIdx > 1 {
-			args.PrevLogTerm = rf.entries[beginIdx-1].Term
+			args.PrevLogTerm = rf.entry(beginIdx - 1).Term
 		}
 		rf.mu.Unlock()
 
@@ -859,7 +1020,7 @@ func (rf *Raft) updateLeaderCommit() {
 		return
 	}
 	var count int
-	for i := len(rf.entries); i > rf.commitIndex; i-- {
+	for i := rf.logSize(); i > rf.commitIndex; i-- {
 		count = 0
 		for j, index := range rf.matchIndex {
 			if j == rf.id {
@@ -877,8 +1038,9 @@ func (rf *Raft) updateLeaderCommit() {
 }
 
 func (rf *Raft) followerTryToCommitUntil(leaderCommitIndex int, leaderTerm int) {
-	newCommitIndex := min(len(rf.entries), leaderCommitIndex)
+	newCommitIndex := min(rf.logSize(), leaderCommitIndex)
 	for newCommitIndex > rf.commitIndex {
+		Assert(rf.logSize() != 0 && (rf.minEntryIndex() <= rf.commitIndex+1 || rf.commitIndex == 0))
 		if rf.entries[newCommitIndex].Term == leaderTerm {
 			rf.commitUntil(newCommitIndex)
 			break
@@ -888,21 +1050,42 @@ func (rf *Raft) followerTryToCommitUntil(leaderCommitIndex int, leaderTerm int) 
 }
 
 func (rf *Raft) commitUntil(commitIndex int) {
-	commitIndex = min(commitIndex, len(rf.entries))
-	Assert(len(rf.entries) >= commitIndex && rf.commitIndex < commitIndex)
+	if rf.killed() {
+		return
+	}
+	commitIndex = min(commitIndex, rf.logSize())
+	Assert(rf.logSize() >= commitIndex)
+	Assert(rf.commitIndex < commitIndex)
 	for i := rf.commitIndex + 1; i <= commitIndex; i++ {
 		rf.commit(i)
-		rf.commitIndex++
 	}
 }
 
 func (rf *Raft) commit(commitIndex int) {
-	Assert(len(rf.entries) >= commitIndex && rf.commitIndex < commitIndex)
-	rf.applyCh <- ApplyMsg{
+	Assert(rf.logSize() >= commitIndex && rf.commitIndex < commitIndex)
+	Assert(commitIndex > rf.discardCount)
+	if rf.killed() {
+		return
+	}
+	rf.commitCh <- ApplyMsg{
 		CommandValid: true,
 		Command:      rf.entries[commitIndex].Cmd,
 		CommandIndex: commitIndex,
 	}
+	rf.commitIndex++
+}
+
+func (rf *Raft) decode(snapshot []byte) (commandIndex int, cmds []interface{}) {
+	Assert(len(snapshot) > 0) // if snapshot==nil, len(snapshot)==0
+	spbuf := bytes.NewBuffer(snapshot)
+	decoder := labgob.NewDecoder(spbuf)
+	if decoder.Decode(&commandIndex) != nil || decoder.Decode(&cmds) != nil {
+		panic("decode error")
+	}
+	Assert(len(cmds) > 1)
+	cmds = cmds[1:] // the first entry is nil
+	Assert(commandIndex == len(cmds))
+	return
 }
 
 //
@@ -925,9 +1108,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.dead = 0
+	rf.commitCh = make(chan ApplyMsg, 400)
 	rf.applyCh = applyCh
 	rf.entries = make(map[int]Entry)
 	rf.commitIndex = 0
+	rf.discardCount = 0
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
@@ -941,10 +1126,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.tick = rf.tickFollower
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go func() {
+		for msg := range rf.commitCh {
+			applyCh <- msg
+		}
+	}()
 
 	return rf
 }
@@ -1017,6 +1207,40 @@ func (rf *Raft) getElectionElapsed() int64 {
 
 func (rf *Raft) getHBElapsed() int64 {
 	return atomic.LoadInt64(&rf.heartBeatElapsed)
+}
+
+func (rf *Raft) entry(index int) Entry {
+	Assert(index > 0)
+	Assert(index >= rf.discardCount)
+	if index == rf.discardCount {
+		return rf.lastdiscarDEntry
+	}
+	// index > rf.discardCount
+	return rf.entries[index]
+}
+
+// assume rf has acquired the lock and the log is not empty
+func (rf *Raft) maxEntryIndex() int {
+	return rf.logSize()
+}
+
+// assume rf has acquired the lock and the log is not empty
+func (rf *Raft) minEntryIndex() int {
+	return rf.discardCount + 1
+}
+
+// assume rf has acquired the lock
+func (rf *Raft) logSize() int {
+	return rf.discardCount + len(rf.entries)
+}
+
+// assume rf has acquired the lock
+func (rf *Raft) undiscard(index int) bool {
+	return index > rf.discardCount
+}
+
+func (rf *Raft) String() string {
+	return fmt.Sprintf("%v(term %v) commit: %v, disc cnt: %v, log size: %v", rf.id, rf.term, rf.commitIndex, rf.discardCount, rf.logSize())
 }
 
 func (rf *Raft) setState(state RaftState) {
