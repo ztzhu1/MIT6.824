@@ -23,7 +23,7 @@ done
 
 if [[ $fail = "false" ]]
 then
-    echo -e "\x1b[1;32mPass\x1b[0m"
+    echo -e "\x1b[1;32mPASS\x1b[0m"
 else
-    echo -e "\x1b[1;31mFail\x1b[0m"
+    echo -e "\x1b[1;31mFAIL\x1b[0m"
 fi
