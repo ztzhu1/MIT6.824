@@ -293,7 +293,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				term := rf.entry(prev).Term
 				i := prev
 				for ; i > 0; i-- {
-					if rf.entry(i).Term != term {
+					if rf.entry(i).Term != term || i <= rf.discardCount {
 						break
 					}
 				}
@@ -706,7 +706,10 @@ func (rf *Raft) recordVoteFor(cand int, termOfCand int, lastLogindexOfCand int, 
 
 // caller should have acquired the lock
 func (rf *Raft) canVoteFor(cand int, termOfCand int, lastLogindexOfCand int, lastLogTermOfCand int) bool {
-	if rf.state == StateLeader || (rf.state != StateFollower && cand != rf.id) {
+	if (rf.isPreCandidate() || rf.isCandidate()) && cand == rf.id {
+		return true
+	}
+	if rf.isLeader() || (!rf.isFollower() && cand != rf.id) {
 		// only followers can vote, except when voting for self
 		return false
 	}
@@ -761,7 +764,7 @@ func (rf *Raft) campaign(t CampaignType) {
 		lastLogindexOfCand := rf.logSize()
 		lastLogTermOfCand := 0
 		if lastLogindexOfCand > 0 {
-			lastLogTermOfCand = rf.entries[lastLogindexOfCand].Term
+			lastLogTermOfCand = rf.entry(lastLogindexOfCand).Term
 		}
 		rf.mu.Unlock()
 
@@ -811,7 +814,7 @@ func (rf *Raft) campaign(t CampaignType) {
 			rf.term++
 			rf.persist()
 			rf.campaign(CampaignCandidate)
-		}else{
+		} else {
 			// unsuccess
 			rf.becomeFollower()
 		}
@@ -847,7 +850,7 @@ func (rf *Raft) bcastRequestVote(replyCh chan RequestVoteReply, candTerm int, ca
 
 func (rf *Raft) requestVote(to int, replyCh chan RequestVoteReply, candTerm int, campType CampaignType, lastLogindexOfCand int, lastLogTermOfCand int) {
 	rf.mu.Lock()
-	if rf.isFollower() {
+	if rf.isFollower() || rf.isLeader() {
 		rf.mu.Unlock()
 		return
 	}
