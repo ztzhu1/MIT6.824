@@ -466,7 +466,7 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	}
 	commandIndex, _ := rf.decode(snapshot)
 	Assert(rf.discardCount == commandIndex)
-	rf.commitIndex=commandIndex
+	rf.commitIndex = commandIndex
 
 	DInfo("%v recovered", rf)
 }
@@ -628,7 +628,10 @@ func (rf *Raft) tickLeader() {
 func (rf *Raft) becomeFollower() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	Assert(rf.state != StateFollower)
+	// Assert(rf.state != StateFollower)
+	if rf.state == StateFollower {
+		return
+	}
 	rf.state = StateFollower
 	rf.resetVote()
 
@@ -734,10 +737,10 @@ func (rf *Raft) upToDateThan(lastLogindexOfCand int, lastLogTermOfCand int) bool
 	if lastLogindexOfCand == 0 {
 		return true
 	}
-	if rf.entries[last].Term > lastLogTermOfCand {
+	if rf.entry(last).Term > lastLogTermOfCand {
 		return true
 	}
-	if rf.entries[last].Term < lastLogTermOfCand {
+	if rf.entry(last).Term < lastLogTermOfCand {
 		return false
 	}
 	// rf.entries[last].Term == lastLogTermOfCand
@@ -772,8 +775,10 @@ func (rf *Raft) campaign(t CampaignType) {
 		if success {
 			rf.becomeCandidate()
 			rf.campaign(CampaignCandidate)
-		} else {
+		} else if rf.isPreCandidate() {
 			rf.becomeFollower()
+		} else {
+			Assert(rf.isFollower())
 		}
 	case t == CampaignCandidate:
 		DPrintf("%v(term %v) campaigning", rf.id, rf.term)
@@ -806,6 +811,9 @@ func (rf *Raft) campaign(t CampaignType) {
 			rf.term++
 			rf.persist()
 			rf.campaign(CampaignCandidate)
+		}else{
+			// unsuccess
+			rf.becomeFollower()
 		}
 	}
 }
